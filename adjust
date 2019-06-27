@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+import collections
+import os
+import io
+import urllib.request
+import sys
+
+import yaml
+import boto3 # AWS SDK
+# if this is running in the pytest suite, symlink destination names have been adjusted to make importing easier
+if 'pytest' in sys.modules:
+    from base_adjust import Adjust  # adjust.py renamed to base adjust to allow this file to be imported normally for testing
+else:
+    from adjust import Adjust
+
+DESC = "EC2 Windows Server adjust driver for Opsani Optune"
+VERSION = "0.0.2"
+HAS_CANCEL = False
+
+config_path = os.environ.get('OPTUNE_CONFIG', './config.yaml')
+aws_access_key_id = os.environ.get('AWS_ACCESS_KEY_ID', '')
+aws_access_key_s = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+aws_default_region = os.environ.get('AWS_DEFAULT_REGION', '')
+
+
+def dict_merge(d, m):
+    for k, v in m.items():
+        if k in d and isinstance(d[k], dict) and isinstance(m[k], collections.Mapping):
+            dict_merge(d[k], m[k])
+        else:
+            d[k] = m[k]
+
+
+class Ec2WinDriver(Adjust):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not (self.args.info or self.args.version):
+            self.config = self.load_config()
+            self.check_config(self.config)
+            self.s3 = boto3.client('s3') # credentials are retreieved from env vars
+
+    @staticmethod
+    def load_config():
+        try:
+            config = yaml.load(open(config_path))
+        except yaml.YAMLError as e:
+            raise Exception('Could not parse config file located at "{}". '
+                            'Please check its contents. Error: {}'.format(config_path, str(e)))
+        return config
+
+    @staticmethod
+    def check_config(config):
+        assert aws_access_key_id is not '' and aws_access_key_s is not '', 'Amazon S3 access key was not provided in environment variables. ' \
+                                        'Please refer to README.md.'
+        assert aws_default_region is not '', 'Amazon S3 default region was not provided in environment variables. ' \
+                                        'Please refer to README.md.'
+        c = config
+        assert c and c.get('ec2win', None), 'EC2 Windows Server Configuration was not provided in "{}". ' \
+                                        'Please refer to README.md'.format(config_path)
+
+        w = c.get('ec2win')
+        assert w.get('web', None), 'Web (IIS 8) Service Configuration was not provided in "{}". ' \
+                                        'Please refer to README.md'.format(config_path)
+
+        i = w.get('web')
+        assert i.get('s3_bucket', None), 'Amazon S3 bucket name was not provided in "{}". ' \
+                                        'Please refer to README.md.'.format(config_path)
+        assert i.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
+                                        'Please refer to README.md.'.format(config_path)
+        assert i.get('ec2_ip', None), 'Amazon S3 path was not provided in "{}". ' \
+                                        'Please refer to README.md.'.format(config_path)
+        # Uncomment if OOTB settings become required
+        # assert i.get('settings', None), 'Section "settings" was not provided in "{}". ' \
+        #                                 'Please refer to README.md.'.format(config_path)
+        assert i.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
+                                        'Please refer to README.md.'.format(config_path)
+        # TODO: validate additional settings where needed
+
+    def adjust(self, data=None):
+        assert data, 'Received no settings to adjust.'
+        settings = data['application']['components']['web']['settings']
+        size = len(settings)
+
+        self.progress = 0
+        self.progress_message = "encoding {} settings".format(size)
+        self.print_progress()
+
+        import encoders.base as enc
+        script = enc.encode(self.config['ec2win']['web']['encoder'], settings)[0]
+
+        self.progress_message = "uploading script to bucket"
+        self.print_progress()
+        script_bytes = script.encode()
+        
+        # script_stream = io.StringIO(script)
+        self.s3.put_object(Body=script_bytes, Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
+
+        self.progress = 100
+        self.progress_message = "adjusted {} settings".format(size)
+        self.print_progress()
+
+    def query(self):
+        # TODO: if we have direct describe access
+        # import encoders.base as enc
+        # script = enc.encode_describe(self.config['ec2win']['web']['encoder'])
+        
+        desc_endpoint = 'http://{}:8080/describe.json'.format(self.config['ec2win']['web']['ec2_ip'])
+        describe_resp = urllib.request.urlopen(desc_endpoint)
+        if describe_resp.status == 404:
+            raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
+
+        if describe_resp.status != 200:
+            raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint))
+
+        raw_data = describe_resp.read()
+        describe_data = raw_data.decode('utf_16_le')
+        return self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
+
+    def encode_describe_if_needed(self, name, data, value):
+        """
+        Takes:
+            * a setting name
+            * setting data (as defined in the config)
+            * value (as returned by the underlying infrastructure)
+
+        Returns a dict in the format { <setting_name> : { <setting_data> }},
+        suitable for returning as a description. At the very minimun,
+        <setting_data> will return the current "value". If the config for that
+        setting specifies an encoder to be used, the returned "value" ( in
+        <setting_data>) will be decoded by the encoder specified in the config.
+        """
+        import encoders.base as enc
+        return enc.describe(data["encoder"], value)
+
+
+if __name__ == '__main__':
+    driver = Ec2WinDriver(cli_desc=DESC, supports_cancel=HAS_CANCEL, version=VERSION)
+    driver.run()

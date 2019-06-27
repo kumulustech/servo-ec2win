@@ -1,0 +1,19 @@
+---
+ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what should it be)
+  web:             # this is the name of the VM's role: web, app, etc.
+    s3_bucket: xxx
+    s3_path: yyy
+    ec2_ip: zzz
+    encoder: 
+      name: dotnet
+      settings:
+        UriEnableCache: 
+          default: 1
+        UriScavengerPeriod: 
+          default: 240
+          min: 200
+          max: 300
+        WebConfigCacheEnabled:
+          default: 0
+        WebConfigEnableKernelCache:
+          default: 1
