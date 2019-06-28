@@ -69,7 +69,7 @@ class Ec2WinDriver(Adjust):
                                         'Please refer to README.md.'.format(config_path)
         assert i.get('ec2_ip', None), 'Amazon S3 path was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
-        # Uncomment if OOTB settings become required
+        # Uncomment if OOTB settings are added
         # assert i.get('settings', None), 'Section "settings" was not provided in "{}". ' \
         #                                 'Please refer to README.md.'.format(config_path)
         assert i.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
@@ -114,7 +114,9 @@ class Ec2WinDriver(Adjust):
 
         raw_data = describe_resp.read()
         describe_data = raw_data.decode('utf_16_le')
-        return self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
+        retVal = {'components': {'web': {'settings': {}}}}
+        retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
+        return retVal
 
     def encode_describe_if_needed(self, name, data, value):
         """
