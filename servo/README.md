@@ -5,12 +5,12 @@
 docker build servo/ -t example.com/servo-ec2win-ab
 ```
 
-<!-- ## Running servo as a Docker service
+## Running servo as a Docker service
 
 ### Create a docker secret with your authentication token
 ```
 echo -n 'myToken'|docker secret create optune_auth_token -
-``` -->
+```
 
 ### Run Servo (as a docker service)
 **@@TBD**:  create/mount secrets for `newrelic_account_id`, `newrelic_apm_api_key`, `newrelic_apm_app_id`, `newrelic_insights_query_key`, and the servo `config.yaml`.  
@@ -36,9 +36,10 @@ docker service create -t --name optune-servo \
 When from a local machine instead of an ec2 instance, the simplest way to provide credentials is via local environment variables using `--env` flags like such:
 ```
 docker service create -t --name optune-servo \
+    --secret optune_auth_token \
+    --env AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
+    --env AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
+    --env AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION} \
     example.com/servo-ec2win-ab \
-    --env "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
-    --env "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
-    --env "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}" \
     app1 --account myAccount
 ```
