@@ -3,7 +3,7 @@ ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what
   web:             # this is the name of the VM's role: web, app, etc.
     s3_bucket: xxx
     s3_path: yyy
-    ec2_ip: zzz
+    # ec2_ip: zzz # this config item is optional and likely to be removed. When supplied, query is performed against a web endpoint. When absent (default) query is performed against the adjust script in s3
     encoder: 
       name: dotnet
       settings:

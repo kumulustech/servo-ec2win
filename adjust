@@ -65,8 +65,6 @@ class Ec2WinDriver(Adjust):
                                         'Please refer to README.md.'.format(config_path)
         assert i.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
-        assert i.get('ec2_ip', None), 'Amazon S3 path was not provided in "{}". ' \
-                                        'Please refer to README.md.'.format(config_path)
         # Uncomment if OOTB settings are added
         # assert i.get('settings', None), 'Section "settings" was not provided in "{}". ' \
         #                                 'Please refer to README.md.'.format(config_path)
@@ -101,20 +99,29 @@ class Ec2WinDriver(Adjust):
         # TODO: if we have direct describe access
         # import encoders.base as enc
         # script = enc.encode_describe(self.config['ec2win']['web']['encoder'])
-        
-        desc_endpoint = 'http://{}:8080/describe.json'.format(self.config['ec2win']['web']['ec2_ip'])
-        describe_resp = urllib.request.urlopen(desc_endpoint)
-        if describe_resp.status == 404:
-            raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
-
-        if describe_resp.status != 200:
-            raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint))
-
-        raw_data = describe_resp.read()
-        describe_data = raw_data.decode('utf_16_le')
         retVal = {'components': {'web': {'settings': {}}}}
-        retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
+        ec2_ip = self.config['ec2win']['web'].get('ec2_ip')
+        if ec2_ip is None:
+            response = self.s3.get_object(Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
+            describe_string = response['Body'].read().decode('utf-8')
+            retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_string)
+
+        else:
+            desc_endpoint = 'http://{}:8080/describe.json'.format(ec2_ip)
+            describe_resp = urllib.request.urlopen(desc_endpoint)
+            if describe_resp.status == 404:
+                raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
+
+            if describe_resp.status != 200:
+                raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint))
+
+            raw_data = describe_resp.read()
+            describe_data = raw_data.decode('utf_16_le')
+            
+            retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
+
         return retVal
+
 
     def encode_describe_if_needed(self, name, data, value):
         """
