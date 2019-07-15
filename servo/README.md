@@ -16,6 +16,7 @@ echo -n 'myToken'|docker secret create optune_auth_token -
 **@@TBD**:  create/mount secrets for `newrelic_account_id`, `newrelic_apm_api_key`, `newrelic_apm_app_id`, `newrelic_insights_query_key`, and the servo `config.yaml`.  
 
 **IMPORTANT** Update the example commands below as needed, e.g., to bind mount config.yaml:  `--mount type=bind,source=/path/to/config.yaml,destination=/servo/config.yaml`
+**DEV/IMPORTANT** When running outside of EC2, Update the example commands below as needed, e.g., to bind mount an aws config directory:  `--mount type=bind,source=/path/to/.aws/,destination=/root/.aws/`
 
 <!-- ```
 docker service create -t --name optune-servo \
@@ -31,15 +32,11 @@ docker service create -t --name optune-servo \
     example.com/servo-ec2asg-newrelic \
     app1 --account myAccount  --auth-token /run/secrets/acme-app1-auth
 ``` -->
-
-**DEV**
-When from a local machine instead of an ec2 instance, the simplest way to provide credentials is via local environment variables using `--env` flags like such:
 ```
+TEST_ENDPOINT=x.x.x.x # ec2 IP
 docker service create -t --name optune-servo \
+    --env AB_TEST_URL=http://$TEST_ENDPOINT/ \
     --secret optune_auth_token \
-    --env AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
-    --env AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
-    --env AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION} \
     example.com/servo-ec2win-ab \
     app1 --account myAccount
 ```
