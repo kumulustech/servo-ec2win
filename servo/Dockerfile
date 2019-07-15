@@ -7,7 +7,9 @@ WORKDIR /servo
 RUN pip3 install requests PyYAML python-dateutil boto3 && \
 	apt-get update && apt-get install -y --no-install-recommends \
     python3-boto \
-    python3-botocore
+    python3-botocore && \
+    apt-get update && apt-get install -y apache2-utils
+
 
 # Change /usr/bin/python3 => /usr/local/bin/python3, since the first is older,
 # so that import of boto3 works
@@ -25,6 +27,9 @@ ADD https://raw.githubusercontent.com/opsani/servo/master/servo \
     https://raw.githubusercontent.com/kumulustech/servo-ec2win/master/adjust \
     https://raw.githubusercontent.com/opsani/servo-ab/master/measure \
     /servo/
+
+# TODO: remove when testing complete
+RUN sed -i 's/10000000,   # request limit/10000,   # request limit/' measure
 
 ADD https://raw.githubusercontent.com/opsani/servo/master/encoders/base.py encoders/ 
 ADD https://raw.githubusercontent.com/kumulustech/encoder-dotnet/master/encoders/dotnet.py encoders/ 
