@@ -149,13 +149,18 @@ class Ec2WinDriver(Adjust):
         bs = self.config['ec2win']['asg'].get('batch_size', 1)
         grp_insts = {}
         wait_counts = {} # count of total number of instances per group, used to track re-instancing process
-        for g in changed_lst:
+        for g in groups:
             grp_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) ] 
             if len(grp_insts[g]) < 1:
                 grp_insts.pop(g)
             else:
                 wait_counts[g] = len(grp_insts[g])
         
+
+        size = len(grp_insts.keys)
+        self.progress = 65
+        self.progress_message = "Terminating {} groups of ASG instances in batches of {}".format(size, bs)
+        self.print_progress()
         while len(grp_insts.keys) > 0:
             term_batch = []
             wait_list = list(grp_insts.keys)
@@ -207,11 +212,12 @@ class Ec2WinDriver(Adjust):
                 if time.time() - start_time > 300:
                     raise Exception("Timed out waiting for new instances to pass status check")
 
-            self.progress = 90
-            self.progress_message = "instances terminated and restarted. Waiting for windows init"
-            self.print_progress()
             # TODO: find a more graceful way to wait for windows init not reflected by ec2 status checks
             time.sleep(60) # wait another minute to allow windows init to finish
+        
+        self.progress = 100
+        self.progress_message = "adjust complete"
+        self.print_progress()
             
         
 
