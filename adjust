@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import collections
 import os
+import time
 import io
 import urllib.request
 import sys
@@ -14,8 +15,10 @@ else:
     from adjust import Adjust
 
 DESC = "EC2 Windows Server adjust driver for Opsani Optune"
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 HAS_CANCEL = False
+
+INST_TYPES=('t2.nano','t2.micro','t2.small','t2.medium','t2.large','t2.xlarge','t2.2xlarge','m4.large','m4.xlarge','m4.2xlarge','m4.4xlarge','m4.10xlarge','m4.16xlarge','r4.large','r4.xlarge','r4.2xlarge','r4.4xlarge','r4.8xlarge','r4.16xlarge','x1.16xlarge','x1.32xlarge','x1e.xlarge','x1e.2xlarge','x1e.4xlarge','x1e.8xlarge','x1e.16xlarge','x1e.32xlarge','i2.xlarge','i2.2xlarge','i2.4xlarge','i2.8xlarge','i3.large','i3.xlarge','i3.2xlarge','i3.4xlarge','i3.8xlarge','i3.16xlarge','i3.metal','c4.large','c4.xlarge','c4.2xlarge','c4.4xlarge','c4.8xlarge','c5.large','c5.xlarge','c5.2xlarge','c5.4xlarge','c5.9xlarge','c5.18xlarge','c5d.large','c5d.xlarge','c5d.2xlarge','c5d.4xlarge','c5d.9xlarge','c5d.18xlarge','g3.4xlarge','g3.8xlarge','g3.16xlarge','p2.xlarge','p2.8xlarge','p2.16xlarge','p3.2xlarge','p3.8xlarge','p3.16xlarge','d2.xlarge','d2.2xlarge','d2.4xlarge','d2.8xlarge','m5.large','m5.xlarge','m5.2xlarge','m5.4xlarge','m5.12xlarge','m5.24xlarge','m5d.large','m5d.xlarge','m5d.2xlarge','m5d.4xlarge','m5d.12xlarge','m5d.24xlarge','h1.2xlarge','h1.4xlarge','h1.8xlarge','h1.16xlarge',)
 
 config_path = os.environ.get('OPTUNE_CONFIG', './config.yaml')
 
@@ -33,7 +36,9 @@ class Ec2WinDriver(Adjust):
         if not (self.args.info or self.args.version):
             self.config = self.load_config()
             self.check_config(self.config)
-            self.s3 = boto3.client('s3') # credentials are retreieved from env vars
+            self.s3 = boto3.client('s3') # credentials are retreieved from env vars or /root/.aws
+            self.ec2 = boto3.client('ec2')
+            self.asg = boto3.client('autoscaling')
 
     @staticmethod
     def load_config():
@@ -65,41 +70,170 @@ class Ec2WinDriver(Adjust):
                                         'Please refer to README.md.'.format(config_path)
         assert i.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
-        # Uncomment if OOTB settings are added
-        # assert i.get('settings', None), 'Section "settings" was not provided in "{}". ' \
-        #                                 'Please refer to README.md.'.format(config_path)
+
+        a = w.get('asg')
+        assert a and a.get('names', None), 'One or more Auto Scaling Group names must be provided to facilitate updating of launch config'
+        bs = a.get('batch_size', None)
+        if bs:
+            assert isinstance(bs, int) and bs > 0, 'Batch size must be a (>0) integer when provided'
+
         assert i.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
         # TODO: validate additional settings where needed
 
     def adjust(self, data=None):
         assert data, 'Received no settings to adjust.'
-        settings = data['application']['components']['web']['settings']
-        size = len(settings)
+        # Adjust windows settings
+        win_settings = data['application']['components'].pop('web', {}).get('settings') # pop web settings to get them out of the way of asg parsing
+        if win_settings:
+            size = len(win_settings)
+            self.progress = 0
+            self.progress_message = "encoding {} windows settings".format(size)
+            self.print_progress()
 
-        self.progress = 0
-        self.progress_message = "encoding {} settings".format(size)
-        self.print_progress()
+            import encoders.base as enc
+            script = enc.encode(self.config['ec2win']['web']['encoder'], win_settings)[0]
 
-        import encoders.base as enc
-        script = enc.encode(self.config['ec2win']['web']['encoder'], settings)[0]
+            self.progress = 25
+            self.progress_message = "uploading powershell script to bucket"
+            self.print_progress()
 
-        self.progress_message = "uploading script to bucket"
-        self.print_progress()
-        script_bytes = script.encode()
+            script_bytes = script.encode()
+            self.s3.put_object(Body=script_bytes, Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
+
+            self.progress = 50
+            self.progress_message = "adjusted {} windows settings".format(size)
+            self.print_progress()
         
-        # script_stream = io.StringIO(script)
-        self.s3.put_object(Body=script_bytes, Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
+        # Adjust ASG launch template if needed
+        groups = self.config["asg"].split(",")
+        data = self.input_data["application"].get("components", {})
+        # print (self.input_data, file=sys.stderr)
+        lst = []
+        for g in groups:
+            c = data.pop(g, None)
+            if not c:
+                continue # no settings for this grp
+            lst.append( (g, c) )
+        # check for components not in 'groups'
+        if data:
+            self.print_json_error(
+                "none",
+                "warning",
+                "input data contains unknown components: "+ repr(list(data.keys()))
+            )
 
-        self.progress = 100
-        self.progress_message = "adjusted {} settings".format(size)
+        changed_lst = []
+        for g,v in lst:
+            if "settings" not in v: continue
+            inst_type = v["settings"].get("inst_type", None)
+            if not inst_type:
+                continue # not set
+            
+            asg_lt_info = self.query_asg_launch_template(g) # tuple [3]
+
+            if inst_type == asg_lt_info[0]:
+                continue # current template version has same instance type
+
+            new_lt_data = { "InstanceType": inst_type }
+            self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=asg_lt_info[2], LaunchTemplateData=new_lt_data)
+            # Done here. NOTE: assumes ASG is configured to reference latest launch template
+            changed_lst.append(g)
+        
+        size = len(changed_lst)
+        self.progress = 60
+        self.progress_message = "adjusted {} asg groups".format(size)
         self.print_progress()
+        
+        # Terminate batch_size instances in each group, wait for ready before terminating next batch
+        bs = self.config['ec2win']['asg'].get('batch_size', 1)
+        grp_insts = {}
+        wait_counts = {} # count of total number of instances per group, used to track re-instancing process
+        for g in changed_lst:
+            grp_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) ] 
+            if len(grp_insts[g]) < 1:
+                grp_insts.pop(g)
+            else:
+                wait_counts[g] = len(grp_insts[g])
+        
+        while len(grp_insts.keys) > 0:
+            term_batch = []
+            wait_list = list(grp_insts.keys)
+            for g in changed_lst:
+                rmng_insts = grp_insts.pop(g, None)
+
+                if rmng_insts is None:
+                    continue
+                
+                term_batch.extend(rmng_insts[:bs])
+                rmng_insts = rmng_insts[bs:]
+                if len(rmng_insts) > 0:
+                    grp_insts[g] = rmng_insts
+
+            # Terminate instances
+            self.ec2.terminate_instances(InstanceIds = term_batch)
+
+            # Wait for ASGs to reach pre-termination quantity of instances
+            instances_reinstantiated = False
+            start_time = time.time()
+            while not instances_reinstantiated:
+                time.sleep(15)
+                instances_reinstantiated = True
+                for g in wait_list:
+                    non_term_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["LifecycleState"] not in ("Terminating", "Terminated") ]
+                    if len(non_term_insts) != wait_counts[g]:
+                        instances_reinstantiated = False
+                        break
+
+                if time.time() - start_time > 120:
+                    raise Exception("Timed out waiting for ASG to make new instances")
+                
+            # Wait for all instances in each wait group to pass status checks
+            instances_ready = False
+            start_time = time.time()
+            while not instances_ready:
+                instances_ready = True
+                for g in wait_list:
+                    cur_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) ]
+                    inst_stats = self.ec2.describe_instance_status(InstanceIds=cur_insts)
+                    for stat in inst_stats["InstanceStatuses"]:
+                        if stat["InstanceStatus"].get("Status") != "ok" or stat["SystemStatus"].get("Status") != "ok":
+                            instances_ready = False
+                            break
+                    if not instances_ready:
+                        break
+                time.sleep(15)
+
+                if time.time() - start_time > 300:
+                    raise Exception("Timed out waiting for new instances to pass status check")
+
+            self.progress = 90
+            self.progress_message = "instances terminated and restarted. Waiting for windows init"
+            self.print_progress()
+            # TODO: find a more graceful way to wait for windows init not reflected by ec2 status checks
+            time.sleep(60) # wait another minute to allow windows init to finish
+            
+        
+
+    def get_asg_instances(self, gname):
+        a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
+        # describe_auto_.. doesn't fail if asg not found, check for it:
+        if not a.get("AutoScalingGroups"):
+            raise Exception("Auto-scaling Group {} does not exist".format(gname))
+        g = a["AutoScalingGroups"][0]
+    
+        # TODO: delete when done
+        # inst_ids = [ i["InstanceId"] for i in g["Instances"] ]
+        # if not inst_ids: # no running instances, return empty
+        #     return []
+
+        return g.get("Instances", [])
+
 
     def query(self):
-        # TODO: if we have direct describe access
-        # import encoders.base as enc
-        # script = enc.encode_describe(self.config['ec2win']['web']['encoder'])
         retVal = {'components': {'web': {'settings': {}}}}
+
+        # Query Windows settings
         ec2_ip = self.config['ec2win']['web'].get('ec2_ip')
         if ec2_ip is None:
             response = self.s3.get_object(Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
@@ -120,7 +254,31 @@ class Ec2WinDriver(Adjust):
             
             retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
 
+        # Query ASG settings
+        groups = self.config['ec2win']['asg']['names'].split(",")
+        for gname in groups:
+            val = self.query_asg_launch_template(gname)[0]
+            retVal['components'][gname] = { "settings" : { "inst_type" : { "value" : val, "type" : "enum", "values" : list(INST_TYPES), "unit" : "ec2" } } }
         return retVal
+
+    def query_asg_launch_template(self, gname):
+        a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
+        if not a.get("AutoScalingGroups"):
+            raise Exception("Auto-scaling Group {} does not exist".format(gname))
+        g = a["AutoScalingGroups"][0]
+        launch_template = g.get("LaunchTemplate")
+        if launch_template is None:# must be able to retrieve launch template. Launch configs are not as programatically flexible, thus are not supported (yet)
+            raise Exception("Could not retrieve launch template for group {}. This driver does not currently support updating instance types of launch groups".format(gname))
+            
+        args = launch_template.copy()
+        args["Versions"] =  [args.pop("Version","$Latest")]
+        cur_template_ver = self.ec2.describe_launch_template_versions(**args)['LaunchTemplateVersions'][0] # should be only one
+
+        return ( 
+            cur_template_ver["LaunchTemplateData"]["InstanceType"],
+            launch_template["LaunchTemplateName"],
+            cur_template_ver["VersionNumber"]
+        )
 
 
     def encode_describe_if_needed(self, name, data, value):
