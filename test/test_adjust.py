@@ -18,6 +18,11 @@ adjust_json_stdin = '''\
                     "TestSite.WebConfigCacheEnabled": {"value": 1},
                     "TestSite.WebConfigEnableKernelCache": {"value": 1}
                 }
+            },
+            "ws2012-sandbox-asg": {
+                "settings": {
+                    "inst_type": {"value": "t2.nano"}
+                }
             }
         }
     }

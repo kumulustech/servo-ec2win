@@ -129,14 +129,18 @@ class Ec2WinDriver(Adjust):
             inst_type = v["settings"].get("inst_type", None)
             if not inst_type:
                 continue # not set
-            
+
+            inst_type_val = inst_type.get("value")
+            if not inst_type_val:
+                raise Exception("No 'value' key provided inst_type dict")
+
             asg_lt_info = self.query_asg_launch_template(g) # tuple [3]
 
-            if inst_type == asg_lt_info[0]:
+            if inst_type_val == asg_lt_info[0]:
                 continue # current template version has same instance type
 
-            new_lt_data = { "InstanceType": inst_type }
-            self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=asg_lt_info[2], LaunchTemplateData=new_lt_data)
+            new_lt_data = { "InstanceType": inst_type_val }
+            self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=str(asg_lt_info[2]), LaunchTemplateData=new_lt_data)
             # Done here. NOTE: assumes ASG is configured to reference latest launch template
             changed_lst.append(g)
         
