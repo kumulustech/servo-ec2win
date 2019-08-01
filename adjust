@@ -61,23 +61,23 @@ class Ec2WinDriver(Adjust):
         assert c and c.get('ec2win', None), 'EC2 Windows Server Configuration was not provided in "{}". ' \
                                         'Please refer to README.md'.format(config_path)
 
-        w = c.get('ec2win')
-        assert w.get('web', None), 'Web (IIS 8) Service Configuration was not provided in "{}". ' \
+        top_level = c.get('ec2win')
+        assert top_level.get('web', None), 'Web (IIS 8) Service Configuration was not provided in "{}". ' \
                                         'Please refer to README.md'.format(config_path)
 
-        i = w.get('web')
-        assert i.get('s3_bucket', None), 'Amazon S3 bucket name was not provided in "{}". ' \
+        w = top_level.get('web')
+        assert w.get('s3_bucket', None), 'Amazon S3 bucket name was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
-        assert i.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
+        assert w.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
 
-        a = w.get('asg')
-        assert a and a.get('names', None), 'One or more Auto Scaling Group names must be provided to facilitate updating of launch config'
-        bs = a.get('batch_size', None)
+        a = top_level.get('asg')
+        assert a, 'One or more Auto Scaling Group names must be provided to facilitate updating of launch config'
+        bs = top_level.get('batch_size', None)
         if bs:
             assert isinstance(bs, int) and bs > 0, 'Batch size must be a (>0) integer when provided'
 
-        assert i.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
+        assert w.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
         # TODO: validate additional settings where needed
 
@@ -106,7 +106,7 @@ class Ec2WinDriver(Adjust):
             self.print_progress()
         
         # Adjust ASG launch template if needed
-        groups = self.config["ec2win"]["asg"]["names"].split(",")
+        groups = self.config["ec2win"]["asg"].split(",")
         data = self.input_data["application"].get("components", {})
         # print (self.input_data, file=sys.stderr)
         lst = []
@@ -150,7 +150,7 @@ class Ec2WinDriver(Adjust):
         self.print_progress()
         
         # Terminate batch_size instances in each group, wait for ready before terminating next batch
-        bs = self.config['ec2win']['asg'].get('batch_size', 1)
+        bs = self.config['ec2win'].get('batch_size', 1)
         grp_insts = {}
         wait_counts = {} # count of total number of instances per group, used to track re-instancing process
         for g in groups:
@@ -195,12 +195,13 @@ class Ec2WinDriver(Adjust):
                 time.sleep(15)
                 instances_reinstantiated = True
                 for g in wait_list:
-                    non_term_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["LifecycleState"] not in ("Terminating", "Terminated") ]
+                    cur_insts = self.get_asg_instances(g)
+                    non_term_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["InstanceId"] not in term_batch ]
                     if len(non_term_insts) != wait_counts[g]:
                         instances_reinstantiated = False
                         break
 
-                if time.time() - start_time > 120:
+                if time.time() - start_time > 180:
                     raise Exception("Timed out waiting for ASG to make new instances")
                 
             # Wait for all instances in each wait group to pass status checks
@@ -211,6 +212,9 @@ class Ec2WinDriver(Adjust):
                 for g in wait_list:
                     cur_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) ]
                     inst_stats = self.ec2.describe_instance_status(InstanceIds=cur_insts)
+                    if not len(inst_stats["InstanceStatuses"]):
+                        instances_ready = False
+                        break
                     for stat in inst_stats["InstanceStatuses"]:
                         if stat["InstanceStatus"].get("Status") != "ok" or stat["SystemStatus"].get("Status") != "ok":
                             instances_ready = False
@@ -271,7 +275,7 @@ class Ec2WinDriver(Adjust):
             retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
 
         # Query ASG settings
-        groups = self.config['ec2win']['asg']['names'].split(",")
+        groups = self.config['ec2win']['asg'].split(",")
         for gname in groups:
             val = self.query_asg_launch_template(gname)[0]
             retVal['components'][gname] = { "settings" : { "inst_type" : { "value" : val, "type" : "enum", "values" : list(INST_TYPES), "unit" : "ec2" } } }

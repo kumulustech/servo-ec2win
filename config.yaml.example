@@ -17,6 +17,5 @@ ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what
           default: 0
         WebConfigEnableKernelCache:
           default: 1
-  asg:
-    names: "name-of-ASG,name-of-ASG2,..."
-    # batch_size: 1
+  asg: "name-of-ASG,name-of-ASG2,..."
+  # batch_size: 1
