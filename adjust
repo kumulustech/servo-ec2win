@@ -172,7 +172,6 @@ class Ec2WinDriver(Adjust):
             term_batch = []
             # Store current keys as they may be removed by the time we wait
             wait_list = list(grp_insts.keys())
-            print('{}'.format(wait_list))
             
             copy_grp_insts = dict(grp_insts)
             for g in copy_grp_insts:
