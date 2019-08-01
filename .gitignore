@@ -10,3 +10,6 @@ scratch.*
 encoders/dotnet.py
 encoders/base.py
 aws_config.env
+test/base_adjust.py
+test/adjust.py
+test/encoders/*

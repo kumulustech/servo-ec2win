@@ -51,7 +51,7 @@ class Ec2WinDriver(Adjust):
 
     @staticmethod
     def check_config(config):
-        if not os.path.isdir('/root/.aws'):
+        if not os.path.isdir('/root/.aws') and not os.path.isdir('{}/.aws'.format(os.path.expanduser('~'))):
             assert os.environ.get('AWS_ACCESS_KEY_ID', '') is not '' and os.environ.get('AWS_SECRET_ACCESS_KEY', '') is not '', 'No Amazon S3 access key was provided. ' \
                                             'Please refer to README.md.'
             assert os.environ.get('AWS_DEFAULT_REGION', '') is not '', 'No Amazon S3 default region was provided. ' \
@@ -106,7 +106,7 @@ class Ec2WinDriver(Adjust):
             self.print_progress()
         
         # Adjust ASG launch template if needed
-        groups = self.config["asg"].split(",")
+        groups = self.config["ec2win"]["asg"]["names"].split(",")
         data = self.input_data["application"].get("components", {})
         # print (self.input_data, file=sys.stderr)
         lst = []
@@ -156,15 +156,22 @@ class Ec2WinDriver(Adjust):
             else:
                 wait_counts[g] = len(grp_insts[g])
         
+        # Empty dict == false
+        if not grp_insts:
+            raise Exception('No group instances found to adjust')
 
-        size = len(grp_insts.keys)
+        size = len(grp_insts)
         self.progress = 65
         self.progress_message = "Terminating {} groups of ASG instances in batches of {}".format(size, bs)
         self.print_progress()
-        while len(grp_insts.keys) > 0:
+        while len(grp_insts) > 0:
             term_batch = []
-            wait_list = list(grp_insts.keys)
-            for g in changed_lst:
+            # Store current keys as they may be removed by the time we wait
+            wait_list = list(grp_insts.keys())
+            print('{}'.format(wait_list))
+            
+            copy_grp_insts = dict(grp_insts)
+            for g in copy_grp_insts:
                 rmng_insts = grp_insts.pop(g, None)
 
                 if rmng_insts is None:
@@ -172,7 +179,7 @@ class Ec2WinDriver(Adjust):
                 
                 term_batch.extend(rmng_insts[:bs])
                 rmng_insts = rmng_insts[bs:]
-                if len(rmng_insts) > 0:
+                if len(rmng_insts) > 0: # If no more to terminate, remove key from grp_insts
                     grp_insts[g] = rmng_insts
 
             # Terminate instances
@@ -253,7 +260,7 @@ class Ec2WinDriver(Adjust):
                 raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
 
             if describe_resp.status != 200:
-                raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint))
+                raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint, describe_resp.status))
 
             raw_data = describe_resp.read()
             describe_data = raw_data.decode('utf_16_le')
@@ -276,7 +283,10 @@ class Ec2WinDriver(Adjust):
         if launch_template is None:# must be able to retrieve launch template. Launch configs are not as programatically flexible, thus are not supported (yet)
             raise Exception("Could not retrieve launch template for group {}. This driver does not currently support updating instance types of launch groups".format(gname))
             
+        
         args = launch_template.copy()
+        if "LaunchTemplateId" in args:
+            args.pop("LaunchTemplateName",None) # keep only one of Id or Name in the args
         args["Versions"] =  [args.pop("Version","$Latest")]
         cur_template_ver = self.ec2.describe_launch_template_versions(**args)['LaunchTemplateVersions'][0] # should be only one
 
