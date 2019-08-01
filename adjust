@@ -227,7 +227,8 @@ class Ec2WinDriver(Adjust):
                     raise Exception("Timed out waiting for new instances to pass status check")
 
             # TODO: find a more graceful way to wait for windows init not reflected by ec2 status checks
-            time.sleep(60) # wait another minute to allow windows init to finish
+            #   should be able to define a custom health check that just hits the server on port 80, but would only work for http apps  
+            time.sleep(120) # wait another 2 minutes to allow windows init to finish
         
         self.progress = 100
         self.progress_message = "adjust complete"
