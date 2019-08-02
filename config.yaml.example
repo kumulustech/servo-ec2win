@@ -18,4 +18,5 @@ ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what
         WebConfigEnableKernelCache:
           default: 1
   asg: "name-of-ASG,name-of-ASG2,..."
+  # ref_asg: "name-of-production-ASG1, name-of-production-ASG2" # Enables 'monitoring' key of describe which returns ASG instance IDs under keys 'instance_ids' and 'ref_instance_ids'
   # batch_size: 1

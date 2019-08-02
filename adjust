@@ -191,6 +191,7 @@ class Ec2WinDriver(Adjust):
             # Wait for ASGs to reach pre-termination quantity of instances
             instances_reinstantiated = False
             start_time = time.time()
+            heartbeat_counter = 0
             while not instances_reinstantiated:
                 time.sleep(15)
                 instances_reinstantiated = True
@@ -200,6 +201,10 @@ class Ec2WinDriver(Adjust):
                     if len(non_term_insts) != wait_counts[g]:
                         instances_reinstantiated = False
                         break
+                
+                heartbeat_counter = (heartbeat_counter + 1) % 2
+                if heartbeat_counter == 0:
+                    self.print_progress()
 
                 if time.time() - start_time > 180:
                     raise Exception("Timed out waiting for ASG to make new instances")
@@ -207,6 +212,7 @@ class Ec2WinDriver(Adjust):
             # Wait for all instances in each wait group to pass status checks
             instances_ready = False
             start_time = time.time()
+            heartbeat_counter = 0
             while not instances_ready:
                 instances_ready = True
                 for g in wait_list:
@@ -223,12 +229,22 @@ class Ec2WinDriver(Adjust):
                         break
                 time.sleep(15)
 
+                heartbeat_counter = (heartbeat_counter + 1) % 2
+                if heartbeat_counter == 0:
+                    self.print_progress()
+
                 if time.time() - start_time > 300:
                     raise Exception("Timed out waiting for new instances to pass status check")
 
             # TODO: find a more graceful way to wait for windows init not reflected by ec2 status checks
             #   should be able to define a custom health check that just hits the server on port 80, but would only work for http apps  
-            time.sleep(120) # wait another 2 minutes to allow windows init to finish
+
+            # time.sleep(120) # wait another 2 minutes to allow windows init to finish, split in 30s intervals for heartbeat
+            if heartbeat_counter == 1:
+                self.print_progress()
+            for _ in range(4):
+                time.sleep(30)
+                self.print_progress()
         
         self.progress = 100
         self.progress_message = "adjust complete"
@@ -242,24 +258,19 @@ class Ec2WinDriver(Adjust):
         if not a.get("AutoScalingGroups"):
             raise Exception("Auto-scaling Group {} does not exist".format(gname))
         g = a["AutoScalingGroups"][0]
-    
-        # TODO: delete when done
-        # inst_ids = [ i["InstanceId"] for i in g["Instances"] ]
-        # if not inst_ids: # no running instances, return empty
-        #     return []
 
         return g.get("Instances", [])
 
 
     def query(self):
-        retVal = {'components': {'web': {'settings': {}}}}
+        retVal = {'application':{'components': {'web': {'settings': {}}}}}
 
         # Query Windows settings
         ec2_ip = self.config['ec2win']['web'].get('ec2_ip')
         if ec2_ip is None:
             response = self.s3.get_object(Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
             describe_string = response['Body'].read().decode('utf-8')
-            retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_string)
+            retVal['application']['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_string)
 
         else:
             desc_endpoint = 'http://{}:8080/describe.json'.format(ec2_ip)
@@ -273,13 +284,32 @@ class Ec2WinDriver(Adjust):
             raw_data = describe_resp.read()
             describe_data = raw_data.decode('utf_16_le')
             
-            retVal['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
+            retVal['application']['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
 
         # Query ASG settings
         groups = self.config['ec2win']['asg'].split(",")
+        ref_groups = self.config['ec2win'].get('ref_asg')
+        if ref_groups:
+            ref_groups = ref_groups.split(",")
+        print(ref_groups)
+        tgt_insts = []
+        ref_insts = []
         for gname in groups:
             val = self.query_asg_launch_template(gname)[0]
-            retVal['components'][gname] = { "settings" : { "inst_type" : { "value" : val, "type" : "enum", "values" : list(INST_TYPES), "unit" : "ec2" } } }
+            retVal['application']['components'][gname] = { "settings" : { "inst_type" : { "value" : val, "type" : "enum", "values" : list(INST_TYPES), "unit" : "ec2" } } }
+            if(ref_groups):
+                tgt_insts.extend(self.get_asg_instances(gname))
+        
+
+        if ref_groups:
+            for gname in ref_groups:
+                ref_insts.extend(self.get_asg_instances(gname))
+                
+            retVal['monitoring'] = {
+                'instance_ids': [ i["InstanceId"] for i in tgt_insts],
+                'ref_instance_ids': [ i["InstanceId"] for i in ref_insts]
+            }
+        
         return retVal
 
     def query_asg_launch_template(self, gname):

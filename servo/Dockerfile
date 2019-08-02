@@ -28,7 +28,7 @@ ADD https://raw.githubusercontent.com/opsani/servo/master/servo \
     /servo/
 
 # TODO: remove when testing complete
-RUN sed -i 's/10000000,   # request limit/10000,   # request limit/' measure
+RUN sed -i 's/10000000,   # request limit/100,   # request limit/' measure
 
 ADD https://raw.githubusercontent.com/opsani/servo/master/encoders/base.py \ 
     https://raw.githubusercontent.com/kumulustech/encoder-dotnet/master/encoders/dotnet.py \
