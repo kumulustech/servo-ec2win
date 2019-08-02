@@ -291,7 +291,7 @@ class Ec2WinDriver(Adjust):
         ref_groups = self.config['ec2win'].get('ref_asg')
         if ref_groups:
             ref_groups = ref_groups.split(",")
-        print(ref_groups)
+        
         tgt_insts = []
         ref_insts = []
         for gname in groups:
