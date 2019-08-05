@@ -29,6 +29,7 @@ ADD https://raw.githubusercontent.com/opsani/servo/master/servo \
 
 # TODO: remove when testing complete
 RUN sed -i 's/10000000,   # request limit/100,   # request limit/' measure
+RUN sed -i 's/30,         # warmup time in seconds/0,         # warmup time in seconds/' measure
 
 ADD https://raw.githubusercontent.com/opsani/servo/master/encoders/base.py \ 
     https://raw.githubusercontent.com/kumulustech/encoder-dotnet/master/encoders/dotnet.py \
