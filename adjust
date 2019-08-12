@@ -5,6 +5,7 @@ import time
 import io
 import urllib.request
 import sys
+import codecs # Used for handling utf16 le BOM
 
 import yaml
 import boto3 # AWS SDK
@@ -68,18 +69,60 @@ class Ec2WinDriver(Adjust):
         w = top_level.get('web')
         assert w.get('s3_bucket', None), 'Amazon S3 bucket name was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
+        assert isinstance(w['s3_bucket'], str), 'Amazon S3 bucket name must be a string'
         assert w.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
+        assert isinstance(w['s3_path'], str), 'Amazon S3 path must be a string'
 
-        a = top_level.get('asg')
+        dprt = w.get('describe_port', None)
+        if dprt:
+            assert (isinstance(dprt, str) and (0 < int(dprt) <= 65535)) or (isinstance(dprt, int) and (0 < dprt <= 65535)), \
+            'Describe port must be a valid port number when provided'
+
+        de = w.get('describe_endpoint', None)
+        if de:
+            assert isinstance(de, str), 'Describe endpoint must be a string containing path to describe when provided'
+        
+
+        ei = w.get('ec2_ip', None)
+        if ei: # Minimal validation since this is mostly for debug using a single instance, should warn in production if still part of codebase
+            assert isinstance(ei, str), 'EC2 Ip must be a string containing IP address when provided'
+
+        a = top_level.get('asg', None)
         assert a, 'One or more Auto Scaling Group names must be provided to facilitate updating of launch config'
+        assert isinstance(a, str), 'Target ASGs must be a string value (comma sperated for multiple values)'
+
+        ra = top_level.get('ref_asg', None)
+        if ra:
+            assert isinstance(ra, str), 'Target ASGs must be a string value (comma sperated for multiple values)'
+        
         bs = top_level.get('batch_size', None)
         if bs:
             assert isinstance(bs, int) and bs > 0, 'Batch size must be a (>0) integer when provided'
 
+        tapb = top_level.get('timeout_adjust_per_batch', None)
+        if tapb:
+            assert isinstance(tapb, int) and bs > 0, 'Time out per batch must be a (>0) integer when provided'
+
+        tic = top_level.get('timeout_inst_create', None)
+        if tic:
+            assert isinstance(tic, int) and bs > 0, 'Time out for instance creation must be a (>0) integer when provided'
+
+        tisc = top_level.get('timeout_inst_status_check', None)
+        if tisc:
+            assert isinstance(tisc, int) and bs > 0, 'Time out for instance status checks must be a (>0) integer when provided'
+        
+        bc = top_level.get('batch_cooldown', None)
+        if bc:
+            assert isinstance(bc, int) and bc > 0, 'Batch cooldown time must be a (>0) integer when provided'
+
+        it = top_level.get('inst_types', None)
+        if it:
+            assert isinstance(it, list) and len(it) > 0, 'Instance types must be a (>0 length) list when provided'
+            assert all(isinstance(t, str) for t in it), 'All instance types must be string values when provided'
+
         assert w.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
                                         'Please refer to README.md.'.format(config_path)
-        # TODO: validate additional settings where needed
 
     def adjust(self, data=None):
         assert data, 'Received no settings to adjust.'
@@ -153,22 +196,35 @@ class Ec2WinDriver(Adjust):
         bs = self.config['ec2win'].get('batch_size', 1)
         grp_insts = {}
         wait_counts = {} # count of total number of instances per group, used to track re-instancing process
+        num_batches = 1
+        num_instances = 0
         for g in groups:
             grp_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) ] 
             if len(grp_insts[g]) < 1:
                 grp_insts.pop(g)
             else:
                 wait_counts[g] = len(grp_insts[g])
-        
+                num_instances += wait_counts[g]
+                num_batches = max(num_batches, (wait_counts[g]/bs + 1 if wait_counts[g]%bs > 0 else 0 ))
+        cur_batch_num = 0
+
         # Empty dict == false
         if not grp_insts:
             raise Exception('No group instances found to adjust')
 
-        size = len(grp_insts)
+        num_asgs = len(grp_insts)
         self.progress = 65
-        self.progress_message = "Terminating {} groups of ASG instances in batches of {}".format(size, bs)
+        self.progress_message = "Terminating {} ASGs totalling {} instances in {} batches of {}".format(num_asgs, num_instances, num_batches, bs)
         self.print_progress()
+
+        outer_start_time = time.time()
+        adjust_timeout = self.config['ec2win'].get('timeout_adjust_per_batch', 720) * num_batches
         while len(grp_insts) > 0:
+            cur_batch_num += 1
+            self.progress_message = "Terminating {} ASGs totalling {} instances in batches of {}: batch {} of {}".format(num_asgs, num_instances, bs, cur_batch_num, num_batches)
+            self.print_progress()
+            if time.time() - outer_start_time > adjust_timeout:
+                raise Exception("Timed out waiting for all batches to complete adjustment")
             term_batch = []
             # Store current keys as they may be removed by the time we wait
             wait_list = list(grp_insts.keys())
@@ -184,7 +240,10 @@ class Ec2WinDriver(Adjust):
                 rmng_insts = rmng_insts[bs:]
                 if len(rmng_insts) > 0: # If no more to terminate, remove key from grp_insts
                     grp_insts[g] = rmng_insts
-
+            
+            # Cache non-term batch # TODO
+            
+            # non_term_insts = [ where i not in term_batch]
             # Terminate instances
             self.ec2.terminate_instances(InstanceIds = term_batch)
 
@@ -206,9 +265,12 @@ class Ec2WinDriver(Adjust):
                 if heartbeat_counter == 0:
                     self.print_progress()
 
-                if time.time() - start_time > 180:
+                if time.time() - start_time > self.config['ec2win'].get('timeout_inst_create', 300):
                     raise Exception("Timed out waiting for ASG to make new instances")
-                
+            
+            if heartbeat_counter == 1:
+                self.print_progress()
+
             # Wait for all instances in each wait group to pass status checks
             instances_ready = False
             start_time = time.time()
@@ -233,17 +295,23 @@ class Ec2WinDriver(Adjust):
                 if heartbeat_counter == 0:
                     self.print_progress()
 
-                if time.time() - start_time > 300:
+                if time.time() - start_time > self.config['ec2win'].get('timeout_inst_status_check', 300):
                     raise Exception("Timed out waiting for new instances to pass status check")
-
-            # TODO: find a more graceful way to wait for windows init not reflected by ec2 status checks
+            
+            if heartbeat_counter == 1:
+                self.print_progress()
+            
+            # TODO: wait for describe.json if avaiable in config
             #   should be able to define a custom health check that just hits the server on port 80, but would only work for http apps  
 
             # time.sleep(120) # wait another 2 minutes to allow windows init to finish, split in 30s intervals for heartbeat
-            if heartbeat_counter == 1:
-                self.print_progress()
-            for _ in range(4):
+            batch_cooldown = self.config['ec2win'].get('batch_cooldown', 120)
+            for _ in range(batch_cooldown // 30):
                 time.sleep(30)
+                self.print_progress()
+            
+            if batch_cooldown % 30 > 0:
+                time.sleep(batch_cooldown % 30)
                 self.print_progress()
         
         self.progress = 100
@@ -268,12 +336,22 @@ class Ec2WinDriver(Adjust):
         # Query Windows settings
         ec2_ip = self.config['ec2win']['web'].get('ec2_ip')
         if ec2_ip is None:
-            response = self.s3.get_object(Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
-            describe_string = response['Body'].read().decode('utf-8')
+            try:
+                response = self.s3.get_object(Bucket=self.config['ec2win']['web']['s3_bucket'], Key=self.config['ec2win']['web']['s3_path'])
+                describe_string = response['Body'].read().decode('utf-8')
+            except Exception as e:
+                self.print_json_error(
+                    e.__class__.__name__,
+                    "failure",
+                    str(e)
+                )
+                describe_string = ''
             retVal['application']['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_string)
 
         else:
-            desc_endpoint = 'http://{}:8080/describe.json'.format(ec2_ip)
+            describe_port = self.config['ec2win']['web'].get('describe_port', '8080')
+            desc_path = self.config['ec2win']['web'].get('describe_endpoint', 'describe.json')
+            desc_endpoint = 'http://{}:{}/{}'.format(ec2_ip, describe_port, desc_path)
             describe_resp = urllib.request.urlopen(desc_endpoint)
             if describe_resp.status == 404:
                 raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
@@ -282,8 +360,12 @@ class Ec2WinDriver(Adjust):
                 raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint, describe_resp.status))
 
             raw_data = describe_resp.read()
-            describe_data = raw_data.decode('utf_16_le')
-            
+            if raw_data.startswith(codecs.BOM_UTF16_LE):
+                raw_data = raw_data[len(codecs.BOM_UTF16_LE):]
+                describe_data = raw_data.decode('utf_16_le')
+            else:
+                raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
+
             retVal['application']['components']['web']['settings'] = self.encode_describe_if_needed(None, self.config['ec2win']['web'], describe_data)
 
         # Query ASG settings
@@ -294,9 +376,10 @@ class Ec2WinDriver(Adjust):
         
         tgt_insts = []
         ref_insts = []
+        inst_vals = self.config['ec2win'].get('inst_types', list(INST_TYPES))
         for gname in groups:
             val = self.query_asg_launch_template(gname)[0]
-            retVal['application']['components'][gname] = { "settings" : { "inst_type" : { "value" : val, "type" : "enum", "values" : list(INST_TYPES), "unit" : "ec2" } } }
+            retVal['application']['components'][gname] = { "settings" : { "inst_type" : { "value" : val, "type" : "enum", "values" : inst_vals, "unit" : "ec2" } } }
             if(ref_groups):
                 tgt_insts.extend(self.get_asg_instances(gname))
         
