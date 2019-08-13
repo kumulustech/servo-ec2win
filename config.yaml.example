@@ -26,6 +26,7 @@ ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what
   # timeout_inst_create: 180
   # timeout_inst_status_check: 300
   # batch_cooldown: 120
+  # timeout_inst_adjust_validated: 120
   # inst_types: 
   # - "t2.nano"
   # - "t2.micro"
