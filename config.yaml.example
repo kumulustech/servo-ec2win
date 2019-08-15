@@ -1,33 +1,42 @@
 ---
 ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what should it be)
   web:             # this is the name of the VM's role: web, app, etc.
-    s3_bucket: xxx
-    s3_path: yyy
+    s3_bucket: xxx  # Bucket where settings script is stored
+    s3_path: yyy  # Path where settings script is stored within bucket
     # describe_port: 8080
     # describe_endpoint: 'describe.json'
-    # ec2_ip: zzz # this config item is optional and likely to be removed. When supplied, query is performed against a web endpoint. When absent (default) query is performed against the adjust script in s3
+    # ec2_ip: zzz.zzz.zzz.zzz
+    asg: aaa
+    # ref_asg: bbb
+    # batch_size: 1
+    # timeout_adjust_per_batch: 720
+    # timeout_inst_create: 300
+    # timeout_inst_status_check: 300
+    # timeout_inst_adjust_validated: 300
+    # batch_cooldown: 300
+    # settings:
+    #   inst_type:
+    #     type": 'enum'
+    #     unit: 'ec2'
+    #     values:
+    #     - 't2.nano'
+    #     - 't2.micro'
+    #     - 't2.small'
     encoder: 
       name: dotnet
       settings:
         UriEnableCache: 
           default: 1
         UriScavengerPeriod: 
-          default: 240
-          min: 200
-          max: 300
+          default: 120
+          min: 10
+          max: 600
         WebConfigCacheEnabled:
           default: 0
         WebConfigEnableKernelCache:
           default: 1
-  asg: "name-of-ASG,name-of-ASG2,..."
-  # ref_asg: "name-of-production-ASG1, name-of-production-ASG2" # Enables 'monitoring' key of describe which returns ASG instance IDs under keys 'instance_ids' and 'ref_instance_ids'
-  # batch_size: 1
-  # timeout_adjust_per_batch: 800
-  # timeout_inst_create: 180
-  # timeout_inst_status_check: 300
-  # batch_cooldown: 120
-  # timeout_inst_adjust_validated: 120
-  # inst_types: 
-  # - "t2.nano"
-  # - "t2.micro"
-  # - "etc..."
+  app:             # this is the name of the VM's role: web, app, etc.
+    s3_bucket: 111  # Bucket where settings script is stored
+    s3_path: 222  # Path where settings script is stored within bucket
+
+    etc... same as 'web' above

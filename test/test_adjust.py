@@ -14,12 +14,17 @@ adjust_json_stdin = '''\
                     "UriEnableCache": {"value": 1},
                     "UriScavengerPeriod": {"value": 260},
                     "WebConfigCacheEnabled": {"value": 0},
-                    "WebConfigEnableKernelCache": {"value": 1}
+                    "WebConfigEnableKernelCache": {"value": 1},
+                    "inst_type": {"value": "t2.micro"}
                 }
             },
-            "ws2012-sandbox-asg": {
+            "app": {
                 "settings": {
-                    "inst_type": {"value": "t2.nano"}
+                    "UriEnableCache": {"value": 1},
+                    "UriScavengerPeriod": {"value": 260},
+                    "WebConfigCacheEnabled": {"value": 0},
+                    "WebConfigEnableKernelCache": {"value": 1},
+                    "inst_type": {"value": "t2.micro"}
                 }
             }
         }
