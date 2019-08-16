@@ -366,8 +366,6 @@ class Ec2WinDriver(Adjust):
                             except urllib.error.URLError: # 10s timeout will trigger URLError but that is expected on fresh instances
                                 adjust_validated = False
                                 break # Not ready yet
-                            if describe_resp.status == 404: # If 404, describe endpint is likely not configured properly
-                                raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
                             if describe_resp.status != 200:
                                 adjust_validated = False
                                 break # Not ready yet
