@@ -68,6 +68,8 @@ class Ec2WinDriver(Adjust):
         assert isinstance(top_level, dict), 'Component Configuration was malformed in "{}". ' \
             'Expected dict, found {}'.format(config_path, top_level.__class__.__name__)
 
+        config_asgs = set()
+        ref_component = '' # string: if ref_asg defined, this is set to component name
         for component_key in top_level:
             component_val = top_level[component_key]
             assert isinstance(component_val, dict), 'Invalid config section for component {}. Expected dict, found {}'.format(
@@ -99,9 +101,19 @@ class Ec2WinDriver(Adjust):
             assert a, 'One or more Auto Scaling Group names must be provided to facilitate updating of launch config'
             assert isinstance(a, str), 'Target ASGs must be a string value (comma sperated for multiple values)'
 
+            comp_asgs = set()
+            for asg in a.split(','):
+                assert asg not in config_asgs, 'Target ASG {} was found under multiple roles/components which may produce undesired behaviour'.format(asg)
+                assert asg not in comp_asgs, 'Target ASG {} was defined twice in a single role/component which may produce undesired behaviour'.format(asg)
+                comp_asgs.add(asg)
+
+            config_asgs.update(comp_asgs)
+
             ra = component_val.get('ref_asg', None)
             if ra:
-                assert isinstance(ra, str), 'Target ASGs must be a string value (comma sperated for multiple values)'
+                assert ref_component is '', 'Reference ASG already defined in component {} cannot be redefined in component {}'.format(ref_component, component_key)
+                assert isinstance(ra, str), 'Reference ASGs must be a string value (comma sperated for multiple values)'
+                ref_component = component_key
             
             bs = component_val.get('batch_size', None)
             if bs:
