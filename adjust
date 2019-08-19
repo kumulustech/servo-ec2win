@@ -53,9 +53,9 @@ class Ec2WinDriver(Adjust):
     @staticmethod
     def check_config(config):
         if not os.path.isdir('/root/.aws') and not os.path.isdir('{}/.aws'.format(os.path.expanduser('~'))):
-            assert os.environ.get('AWS_ACCESS_KEY_ID', '') is not '' and os.environ.get('AWS_SECRET_ACCESS_KEY', '') is not '', 'No Amazon S3 access key was provided. ' \
+            assert os.environ.get('AWS_ACCESS_KEY_ID', '') != '' and os.environ.get('AWS_SECRET_ACCESS_KEY', '') != '', 'No Amazon S3 access key was provided. ' \
                                             'Please refer to README.md.'
-            assert os.environ.get('AWS_DEFAULT_REGION', '') is not '', 'No Amazon S3 default region was provided. ' \
+            assert os.environ.get('AWS_DEFAULT_REGION', '') != '', 'No Amazon S3 default region was provided. ' \
                                             'Please refer to README.md.'
 
         c = config
@@ -111,7 +111,7 @@ class Ec2WinDriver(Adjust):
 
             ra = component_val.get('ref_asg', None)
             if ra:
-                assert ref_component is '', 'Reference ASG already defined in component {} cannot be redefined in component {}'.format(ref_component, component_key)
+                assert ref_component == '', 'Reference ASG already defined in component {} cannot be redefined in component {}'.format(ref_component, component_key)
                 assert isinstance(ra, str), 'Reference ASGs must be a string value (comma sperated for multiple values)'
                 ref_component = component_key
             
@@ -208,7 +208,7 @@ class Ec2WinDriver(Adjust):
             num_batches = 1
             num_instances = 0
             for g in groups:
-                grp_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) ] 
+                grp_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["LifecycleState"] == "InService" ] 
                 if len(grp_insts[g]) < 1:
                     grp_insts.pop(g)
                 else:
@@ -220,7 +220,7 @@ class Ec2WinDriver(Adjust):
 
             # Empty dict == false
             if not grp_insts:
-                raise Exception('No group instances found to adjust')
+                raise Exception('Component {}: no group instances to adjust in ASG(s) {}'.format(component_key, ', '.join(groups)))
             num_asgs = len(grp_insts)
             # self.progress = 65
             self.progress_message = "Terminating {} ASGs totalling {} instances in {} batches of {}".format(num_asgs, num_instances, num_batches, bs)
@@ -256,7 +256,15 @@ class Ec2WinDriver(Adjust):
                         grp_insts[g] = rmng_insts
                 
                 # Terminate instances
-                self.ec2.terminate_instances(InstanceIds = term_batch)
+                if len(term_batch) < 1:
+                    raise Exception("Failed to get inservice instances to terminate for component {}".format(component_key))
+                resp = self.ec2.terminate_instances(InstanceIds = term_batch)
+                if not resp.get('TerminatingInstances'):
+                    raise Exception("Failed to terminate instances for component {}. Response: {}", component_key, resp)
+
+                termed_ids = [i['InstanceId'] for i in resp['TerminatingInstances']]
+                if len(term_batch) != len(termed_ids):
+                    raise Exception("Failed to terminate instances for component {}. Batch Ids: {}. Terminated Ids: {}", component_key, ', '.join(term_batch), ', '.join(termed_ids))
 
                 # Wait for ASGs to reach pre-termination quantity of instances
                 instances_reinstantiated = False
@@ -266,8 +274,10 @@ class Ec2WinDriver(Adjust):
                     time.sleep(15)
                     instances_reinstantiated = True
                     for g in wait_list:
-                        cur_insts = self.get_asg_instances(g)
-                        non_term_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["InstanceId"] not in term_batch ]
+                        non_term_insts = [ 
+                            i["InstanceId"] for i in self.get_asg_instances(g) 
+                            if i["InstanceId"] not in term_batch
+                            and i["LifecycleState"] == "InService" ]
                         if len(non_term_insts) != wait_counts[g]:
                             instances_reinstantiated = False
                             break
@@ -289,7 +299,10 @@ class Ec2WinDriver(Adjust):
                 while not instances_ready:
                     instances_ready = True
                     for g in wait_list:
-                        cur_insts = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["InstanceId"] not in term_batch ]
+                        cur_insts = [ 
+                            i["InstanceId"] for i in self.get_asg_instances(g) 
+                            if i["InstanceId"] not in term_batch 
+                            and i["LifecycleState"] == "InService" ]
                         inst_stats = self.ec2.describe_instance_status(InstanceIds=cur_insts)
                         if not len(inst_stats["InstanceStatuses"]):
                             instances_ready = False
@@ -325,13 +338,14 @@ class Ec2WinDriver(Adjust):
                 else:
                     new_insts = {}
                     for g in wait_list:
-                        new_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) \
-                            # not in instances not yet terminated
-                            if i["InstanceId"] not in grp_insts.get(g, [])  \
-                            # and not in instances we've already validated
-                            and i["InstanceId"] not in validated_insts[g] 
+                        new_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g)
                             # terminated instances continue to show up for a while after termination
-                            and i["InstanceId"] not in term_batch ]
+                            if i["LifecycleState"] == "InService"
+                            and i["InstanceId"] not in term_batch
+                            # and not in instances yet to be terminated
+                            and i["InstanceId"] not in grp_insts.get(g, [])
+                            # and not in instances we've already validated
+                            and i["InstanceId"] not in validated_insts[g] ]
                         
                         if len(new_insts[g]) < 1:
                             new_insts.pop(g)
@@ -340,8 +354,8 @@ class Ec2WinDriver(Adjust):
                     for g in new_insts:
                         list_new_inst_ids.extend(new_insts[g])
 
-                    if len(list_new_inst_ids) is not len(term_batch):
-                        raise Exception("Unable to retrieve new EC2 instances. Count found: {}, count expected: {}".format(len(list_new_inst_ids), len(term_batch)))
+                    if len(list_new_inst_ids) != len(term_batch):
+                        raise Exception("Unable to retrieve new EC2 instances for groups {}. Count found: {}, count expected: {}".format(', '.join(wait_list) , len(list_new_inst_ids), len(term_batch)))
 
                     inst_stat_resp = self.ec2.describe_instances(InstanceIds=list_new_inst_ids)
                     if not inst_stat_resp or not inst_stat_resp.get('Reservations'):
@@ -351,7 +365,7 @@ class Ec2WinDriver(Adjust):
                     for r in inst_stat_resp['Reservations']:
                         new_inst_ips.extend([i['PublicIpAddress'] for i in r['Instances'] ])
 
-                    if len(new_inst_ips) is not len(term_batch):
+                    if len(new_inst_ips) != len(term_batch):
                         raise Exception("Unable to retrieve IP addresses for new EC2 instances. Count found: {}, count expected: {}".format(len(new_inst_ips), len(term_batch)))
 
                     adjust_validated = False
