@@ -4,6 +4,7 @@ import os
 import time
 import io
 import urllib.request
+import socket # for handling timeout
 import sys
 import codecs # Used for handling utf16 le BOM
 
@@ -24,7 +25,7 @@ INST_TYPES=('t2.nano','t2.micro','t2.small','t2.medium','t2.large','t2.xlarge','
 config_path = os.environ.get('OPTUNE_CONFIG', './config.yaml')
 
 def dict_merge(d, m):
-    for k, v in m.items():
+    for k, _ in m.items():
         if k in d and isinstance(d[k], dict) and isinstance(m[k], collections.Mapping):
             dict_merge(d[k], m[k])
         else:
@@ -204,7 +205,7 @@ class Ec2WinDriver(Adjust):
 
             grp_insts = {}
             validated_insts = {} # keep track of validated instance IDs to exclude from describe endpoint validation
-            wait_counts = {} # count of total number of instances per group, used to track re-instancing process
+            group_counts = {} # count of total number of instances per group, used to track progress
             num_batches = 1
             num_instances = 0
             for g in groups:
@@ -212,10 +213,10 @@ class Ec2WinDriver(Adjust):
                 if len(grp_insts[g]) < 1:
                     grp_insts.pop(g)
                 else:
-                    wait_counts[g] = len(grp_insts[g])
+                    group_counts[g] = len(grp_insts[g])
                     validated_insts[g] = []
-                    num_instances += wait_counts[g]
-                    num_batches = max(num_batches, (wait_counts[g]//bs + 1 if wait_counts[g]%bs > 0 else 0 ))
+                    num_instances += group_counts[g]
+                    num_batches = max(num_batches, (group_counts[g]//bs + 1 if group_counts[g]%bs > 0 else 0 ))
             cur_batch_num = 0
 
             # Empty dict == false
@@ -231,6 +232,7 @@ class Ec2WinDriver(Adjust):
 
             if self.config['ec2win'][component_key].get('describe_endpoint'): # format validation endpoint when provided
                 desc_endpoint_frmtstr = 'http://{{}}:{}/{}'.format(self.config['ec2win'][component_key].get('describe_port', 8080), self.config['ec2win'][component_key]['describe_endpoint'])
+            
             while len(grp_insts) > 0:
                 cur_batch_num += 1
                 self.progress_message = "Terminating {} ASGs totalling {} instances in batches of {}: batch {} of {}".format(num_asgs, num_instances, bs, cur_batch_num, num_batches)
@@ -267,63 +269,19 @@ class Ec2WinDriver(Adjust):
                     raise Exception("Failed to terminate instances for component {}. Batch Ids: {}. Terminated Ids: {}", component_key, ', '.join(term_batch), ', '.join(termed_ids))
 
                 # Wait for ASGs to reach pre-termination quantity of instances
-                instances_reinstantiated = False
-                start_time = time.time()
-                heartbeat_counter = 0
-                while not instances_reinstantiated:
-                    time.sleep(15)
-                    instances_reinstantiated = True
-                    for g in wait_list:
-                        non_term_insts = [ 
-                            i["InstanceId"] for i in self.get_asg_instances(g) 
-                            if i["InstanceId"] not in term_batch
-                            and i["LifecycleState"] == "InService" ]
-                        if len(non_term_insts) != wait_counts[g]:
-                            instances_reinstantiated = False
-                            break
-                    
-                    heartbeat_counter = (heartbeat_counter + 1) % 2
-                    if heartbeat_counter == 0:
-                        self.print_progress()
-
-                    if time.time() - start_time > self.config['ec2win'][component_key].get('timeout_inst_create', 300):
-                        raise Exception("Timed out waiting for ASG to make new instances")
-                
-                if heartbeat_counter == 1:
-                    self.print_progress()
+                self.wait_for_condition_or_timeout(
+                    lambda: self.verify_asg_desired_capacity(wait_list, term_batch),
+                    self.config['ec2win'][component_key].get('timeout_inst_create', 300),
+                    "Timed out waiting for ASG to make new instances"
+                )
 
                 # Wait for all instances in each wait group to pass status checks
-                instances_ready = False
-                start_time = time.time()
-                heartbeat_counter = 0
-                while not instances_ready:
-                    instances_ready = True
-                    for g in wait_list:
-                        cur_insts = [ 
-                            i["InstanceId"] for i in self.get_asg_instances(g) 
-                            if i["InstanceId"] not in term_batch 
-                            and i["LifecycleState"] == "InService" ]
-                        inst_stats = self.ec2.describe_instance_status(InstanceIds=cur_insts)
-                        if not len(inst_stats["InstanceStatuses"]):
-                            instances_ready = False
-                            break
-                        for stat in inst_stats["InstanceStatuses"]:
-                            if stat["InstanceStatus"].get("Status") != "ok" or stat["SystemStatus"].get("Status") != "ok":
-                                instances_ready = False
-                                break
-                        if not instances_ready:
-                            break
-                    time.sleep(15)
-
-                    heartbeat_counter = (heartbeat_counter + 1) % 2
-                    if heartbeat_counter == 0:
-                        self.print_progress()
-
-                    if time.time() - start_time > self.config['ec2win'][component_key].get('timeout_inst_status_check', 300):
-                        raise Exception("Timed out waiting for new instances to pass status check")
-                
-                if heartbeat_counter == 1:
-                    self.print_progress()
+                self.wait_for_condition_or_timeout(
+                    lambda: self.verify_asg_status_checks(wait_list, term_batch),
+                    self.config['ec2win'][component_key].get('timeout_inst_status_check', 300),
+                    "Timed out waiting for new instances to pass status check",
+                    pre_check=True
+                )
 
                 if not self.config['ec2win'][component_key].get('describe_endpoint'):
                     # wait an amount of time to allow windows init to finish, split in 30s intervals for heartbeat
@@ -361,52 +319,23 @@ class Ec2WinDriver(Adjust):
                     if not inst_stat_resp or not inst_stat_resp.get('Reservations'):
                         raise Exception("Unable to describe new EC2 instances via boto3 client. Response: {}".format(inst_stat_resp))
 
-                    new_inst_ips = []
+                    new_insts_described = []
                     for r in inst_stat_resp['Reservations']:
-                        new_inst_ips.extend([i['PublicIpAddress'] for i in r['Instances'] ])
+                        new_insts_described.extend(r['Instances'])
 
-                    if len(new_inst_ips) != len(term_batch):
-                        raise Exception("Unable to retrieve IP addresses for new EC2 instances. Count found: {}, count expected: {}".format(len(new_inst_ips), len(term_batch)))
+                    if len(new_insts_described) != len(term_batch):
+                        raise Exception("Unable to retrieve detailed info (IP addr) for new EC2 instances. Count found: {}, count expected: {}".format(len(new_insts_described), len(term_batch)))
 
-                    adjust_validated = False
-                    start_time = time.time()
-                    heartbeat_counter = 0
-                    while not adjust_validated:
-                        adjust_validated = True
-                        for i in new_inst_ips:
-                            desc_endpoint = desc_endpoint_frmtstr.format(i)
-                            try:
-                                describe_resp = urllib.request.urlopen(url=desc_endpoint, timeout=10)
-                            except urllib.error.URLError: # 10s timeout will trigger URLError but that is expected on fresh instances
-                                adjust_validated = False
-                                break # Not ready yet
-                            if describe_resp.status != 200:
-                                adjust_validated = False
-                                break # Not ready yet
-                
-                            raw_data = describe_resp.read()
-                            if raw_data.startswith(codecs.BOM_UTF16_LE):
-                                raw_data = raw_data[len(codecs.BOM_UTF16_LE):] # remove BOM
-                                describe_data = raw_data.decode('utf_16_le')
-                            else:
-                                raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
-                
-                            desc_settings = self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data)
-                            for key in desc_settings:
-                                if settings.get(key) and desc_settings[key]['value'] != settings[key]['value']:
-                                    raise Exception('Validation failed for setting {}: describe endpoint value {} did not match input value {}'.format(
-                                            key,
-                                            desc_settings[key]['value'],
-                                            settings[key]['value']
-                                        ))
-                            
-                        time.sleep(5)
-                        heartbeat_counter = (heartbeat_counter + 1) % 2
-                        if heartbeat_counter == 0:
-                            self.print_progress()
-
-                        if time.time() - start_time > self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300):
-                            raise Exception("Timed out waiting for validation of new instances' adjustments")
+                    self.wait_for_condition_or_timeout(
+                        evaluator=lambda: self.get_failed_adjust_insts(
+                            described_instances=new_insts_described, 
+                            endpoint_frmtstr=desc_endpoint_frmtstr, 
+                            encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
+                            settings_to_verify=settings
+                        ) == [], # Note evaluator is waiting failed insts to be empty array
+                        timeout=self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300),
+                        timeout_errmsg="Timed out waiting for validation of new instances' adjustments"
+                    )
                     
                     # Validation complete, add current iteration to validated list
                     for g in new_insts:
@@ -424,18 +353,106 @@ class Ec2WinDriver(Adjust):
         self.progress = 100
         self.progress_message = "adjust complete"
         self.print_progress()
-            
-        
 
-    def get_asg_instances(self, gname):
+    # Sleep for 15 seconds then check evaluator. Error when tiemout expires
+    def wait_for_condition_or_timeout(self, evaluator, timeout, timeout_errmsg, pre_check = False):
+        if pre_check:
+            finished = evaluator()
+        else:
+            finished = False
+        start_time = time.time()
+        heartbeat_counter = 0
+        self.print_progress()
+        while not finished:
+            if time.time() - start_time > timeout:
+                raise Exception(timeout_errmsg)
+            time.sleep(15)
+
+            finished = evaluator()
+
+            heartbeat_counter = (heartbeat_counter + 1) % 2
+            if heartbeat_counter == 0:
+                self.print_progress()
+        
+        if heartbeat_counter == 1:
+            self.print_progress()
+
+    def get_asg_info(self, gname):
         a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
         # describe_auto_.. doesn't fail if asg not found, check for it:
         if not a.get("AutoScalingGroups"):
             raise Exception("Auto-scaling Group {} does not exist".format(gname))
-        g = a["AutoScalingGroups"][0]
+        if len(a["AutoScalingGroups"]) > 1:
+            raise Exception("Auto-scaling Group name {} returned multiple results: {}".format(gname, a))
+        return a["AutoScalingGroups"][0]
 
-        return g.get("Instances", [])
+    def get_asg_instances(self, gname):
+        return self.get_asg_info(gname).get("Instances", [])
 
+    def verify_asg_desired_capacity(self, groups, terminated_ids):
+        for g in groups:
+            cur_status = self.get_asg_info(g)
+            non_term_insts = [ 
+                i["InstanceId"] for i in cur_status.get("Instances", [])
+                if i["InstanceId"] not in terminated_ids
+                and i["LifecycleState"] == "InService" ]
+            if len(non_term_insts) != cur_status['DesiredCapacity']:
+                return False
+
+        return True
+
+    def verify_asg_status_checks(self, groups, terminated_ids):
+        for g in groups:
+            cur_insts = [ 
+                i["InstanceId"] for i in self.get_asg_instances(g) 
+                if i["InstanceId"] not in terminated_ids 
+                and i["LifecycleState"] == "InService" ]
+            inst_stats = self.ec2.describe_instance_status(InstanceIds=cur_insts)
+            if not len(inst_stats["InstanceStatuses"]):
+                return False
+
+            for stat in inst_stats["InstanceStatuses"]:
+                if stat["InstanceStatus"].get("Status") != "ok" or stat["SystemStatus"].get("Status") != "ok":
+                    return False
+        
+        return True
+            
+    # Unlike the other validators, this will return a list of failing instances to facilitate their termination
+    def get_failed_adjust_insts(self, described_instances, endpoint_frmtstr, encoder_method, settings_to_verify):
+        failed_instances = []
+        for i in described_instances:
+            desc_endpoint = endpoint_frmtstr.format(i["PublicIpAddress"])
+            try:
+                describe_resp = urllib.request.urlopen(url=desc_endpoint, timeout=10)
+            except urllib.error.URLError: # 10s timeout will trigger URLError but that is expected on fresh instances
+                failed_instances.append(i["InstanceId"])
+                continue
+            except socket.timeout:
+                failed_instances.append(i["InstanceId"])
+                continue
+            if describe_resp.status != 200:
+                failed_instances.append(i["InstanceId"])
+                continue
+
+            raw_data = describe_resp.read()
+            if raw_data.startswith(codecs.BOM_UTF16_LE):
+                raw_data = raw_data[len(codecs.BOM_UTF16_LE):] # remove BOM
+                describe_data = raw_data.decode('utf_16_le')
+            else:
+                raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
+
+            # The failures we're concerned with here-in are limited to IIS failing to deploy and producing 500 error codes and the json never being available
+            # Misalignment of settings would be indicative of some other type of issue so it produces an error accordingly
+            desc_settings = encoder_method(describe_data)
+            for key in desc_settings:
+                if settings_to_verify.get(key) and desc_settings[key]['value'] != settings_to_verify[key]['value']:
+                    raise Exception('Validation failed for setting {}: describe endpoint value {} did not match input value {}'.format(
+                            key,
+                            desc_settings[key]['value'],
+                            settings_to_verify[key]['value']
+                        ))
+        
+        return failed_instances
 
     def query(self):
         retVal = {'application':{'components': {}}}
