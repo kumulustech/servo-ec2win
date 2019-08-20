@@ -257,31 +257,11 @@ class Ec2WinDriver(Adjust):
                     if len(rmng_insts) > 0: # If no more to terminate, remove key from grp_insts
                         grp_insts[g] = rmng_insts
                 
-                # Terminate instances
                 if len(term_batch) < 1:
                     raise Exception("Failed to get inservice instances to terminate for component {}".format(component_key))
-                resp = self.ec2.terminate_instances(InstanceIds = term_batch)
-                if not resp.get('TerminatingInstances'):
-                    raise Exception("Failed to terminate instances for component {}. Response: {}", component_key, resp)
 
-                termed_ids = [i['InstanceId'] for i in resp['TerminatingInstances']]
-                if len(term_batch) != len(termed_ids):
-                    raise Exception("Failed to terminate instances for component {}. Batch Ids: {}. Terminated Ids: {}", component_key, ', '.join(term_batch), ', '.join(termed_ids))
-
-                # Wait for ASGs to reach pre-termination quantity of instances
-                self.wait_for_condition_or_timeout(
-                    lambda: self.verify_asg_desired_capacity(wait_list, term_batch),
-                    self.config['ec2win'][component_key].get('timeout_inst_create', 300),
-                    "Timed out waiting for ASG to make new instances"
-                )
-
-                # Wait for all instances in each wait group to pass status checks
-                self.wait_for_condition_or_timeout(
-                    lambda: self.verify_asg_status_checks(wait_list, term_batch),
-                    self.config['ec2win'][component_key].get('timeout_inst_status_check', 300),
-                    "Timed out waiting for new instances to pass status check",
-                    pre_check=True
-                )
+                # Terminate instances
+                self.terminate_instances_and_wait_for_status_checks(term_batch, wait_list, component_key)
 
                 if not self.config['ec2win'][component_key].get('describe_endpoint'):
                     # wait an amount of time to allow windows init to finish, split in 30s intervals for heartbeat
@@ -326,20 +306,100 @@ class Ec2WinDriver(Adjust):
                     if len(new_insts_described) != len(term_batch):
                         raise Exception("Unable to retrieve detailed info (IP addr) for new EC2 instances. Count found: {}, count expected: {}".format(len(new_insts_described), len(term_batch)))
 
-                    self.wait_for_condition_or_timeout(
+                    adj_validation_passed = self.wait_for_condition_or_timeout(
                         evaluator=lambda: self.get_failed_adjust_insts(
                             described_instances=new_insts_described, 
                             endpoint_frmtstr=desc_endpoint_frmtstr, 
                             encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
                             settings_to_verify=settings
                         ) == [], # Note evaluator is waiting failed insts to be empty array
-                        timeout=self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300),
-                        timeout_errmsg="Timed out waiting for validation of new instances' adjustments"
+                        timeout=self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300)
                     )
-                    
-                    # Validation complete, add current iteration to validated list
-                    for g in new_insts:
-                        validated_insts[g].extend(new_insts[g])
+                    # "Timed out waiting for validation of new instances' adjustments"
+                    if not adj_validation_passed:
+                        termination_attempts = 3
+                        failed_list = []
+                        while termination_attempts > 0:
+                            failed_insts = self.get_failed_adjust_insts(
+                                described_instances=new_insts_described, 
+                                endpoint_frmtstr=desc_endpoint_frmtstr, 
+                                encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
+                                settings_to_verify=settings
+                            )
+                            failed_list.extend(failed_insts)
+
+                            for g in new_insts:
+                                validated_insts[g].extend([i for i in new_insts[g] if i not in failed_insts])
+                                new_insts[g] = [i for i in new_insts[g] if i in failed_insts]
+                                if len(new_insts[g]) < 1:
+                                    new_insts.pop(g)
+
+                            wait_list = list(new_insts.keys)
+
+                            # Terminate failed instances
+                            self.terminate_instances_and_wait_for_status_checks(failed_insts, wait_list, component_key)
+
+                            new_insts = {}
+                            for g in wait_list:
+                                new_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g)
+                                    # terminated instances continue to show up for a while after termination
+                                    if i["LifecycleState"] == "InService"
+                                    and i["InstanceId"] not in term_batch
+                                    and i["InstanceId"] not in failed_list
+                                    # and not in instances yet to be terminated
+                                    and i["InstanceId"] not in grp_insts.get(g, [])
+                                    # and not in instances we've already validated
+                                    and i["InstanceId"] not in validated_insts[g] ]
+                                
+                                if len(new_insts[g]) < 1:
+                                    new_insts.pop(g)
+
+                            list_new_inst_ids = []
+                            for g in new_insts:
+                                list_new_inst_ids.extend(new_insts[g])
+
+                            if len(list_new_inst_ids) != len(failed_insts):
+                                raise Exception("During termination retry, Unable to retrieve new EC2 instances for groups {}. Count found: {}, count expected: {}".format(', '.join(wait_list) , len(list_new_inst_ids), len(failed_insts)))
+
+                            inst_stat_resp = self.ec2.describe_instances(InstanceIds=list_new_inst_ids)
+                            if not inst_stat_resp or not inst_stat_resp.get('Reservations'):
+                                raise Exception("During termination retry, Unable to describe new EC2 instances via boto3 client. Response: {}".format(inst_stat_resp))
+
+                            new_insts_described = []
+                            for r in inst_stat_resp['Reservations']:
+                                new_insts_described.extend(r['Instances'])
+
+                            if len(new_insts_described) != len(failed_insts):
+                                raise Exception("During termination retry, Unable to retrieve detailed info (IP addr) for new EC2 instances. Count found: {}, count expected: {}".format(len(new_insts_described), len(failed_insts)))
+
+                            if self.wait_for_condition_or_timeout(
+                                evaluator=lambda: self.get_failed_adjust_insts(
+                                    described_instances=new_insts_described, 
+                                    endpoint_frmtstr=desc_endpoint_frmtstr, 
+                                    encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
+                                    settings_to_verify=settings
+                                ) == [], # Note evaluator is waiting failed insts to be empty array
+                                timeout=self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300)
+                            ):
+                                for g in new_insts:
+                                    validated_insts[g].extend(new_insts[g])
+                                break
+
+                            termination_attempts -= 1
+
+                        if termination_attempts == 0:
+                            failed_insts = self.get_failed_adjust_insts(
+                                described_instances=new_insts_described, 
+                                endpoint_frmtstr=desc_endpoint_frmtstr, 
+                                encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
+                                settings_to_verify=settings
+                            )
+                            raise Exception("Validation failed for {} instances after 3 attempts to terminate and re-create the instances. Failed instance IDs: {}".format(len(failed_insts), ", ".join(failed_insts)))
+                            
+                    else:                    
+                        # Validation complete, add current iteration to validated list
+                        for g in new_insts:
+                            validated_insts[g].extend(new_insts[g])
 
 
         # check for components not in config
@@ -354,8 +414,8 @@ class Ec2WinDriver(Adjust):
         self.progress_message = "adjust complete"
         self.print_progress()
 
-    # Sleep for 15 seconds then check evaluator. Error when tiemout expires
-    def wait_for_condition_or_timeout(self, evaluator, timeout, timeout_errmsg, pre_check = False):
+    # Sleep for 15 seconds then check evaluator. Return False when tiemout expires, True when condition passes
+    def wait_for_condition_or_timeout(self, evaluator, timeout, pre_check = False):
         if pre_check:
             finished = evaluator()
         else:
@@ -365,7 +425,7 @@ class Ec2WinDriver(Adjust):
         self.print_progress()
         while not finished:
             if time.time() - start_time > timeout:
-                raise Exception(timeout_errmsg)
+                return False
             time.sleep(15)
 
             finished = evaluator()
@@ -376,6 +436,8 @@ class Ec2WinDriver(Adjust):
         
         if heartbeat_counter == 1:
             self.print_progress()
+
+        return True
 
     def get_asg_info(self, gname):
         a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
@@ -416,6 +478,31 @@ class Ec2WinDriver(Adjust):
                     return False
         
         return True
+
+    def terminate_instances_and_wait_for_status_checks(self, termination_ids, groups, calling_component):
+        # Terminate instances
+        resp = self.ec2.terminate_instances(InstanceIds = termination_ids)
+        if not resp.get('TerminatingInstances'):
+            raise Exception("Failed to terminate instances for component {}. Response: {}", calling_component, resp)
+
+        termed_ids = [i['InstanceId'] for i in resp['TerminatingInstances']]
+        if len(termination_ids) != len(termed_ids):
+            raise Exception("Failed to terminate instances for component {}. Batch Ids: {}. Terminated Ids: {}", calling_component, ', '.join(termination_ids), ', '.join(termed_ids))
+
+        # Wait for ASGs to reach pre-termination quantity of instances
+        if not self.wait_for_condition_or_timeout(
+            lambda: self.verify_asg_desired_capacity(groups, termination_ids),
+            self.config['ec2win'][calling_component].get('timeout_inst_create', 300)
+        ):
+            raise Exception("Timed out waiting for ASG to make new instances for component {}".format(calling_component))
+
+        # Wait for all instances in each wait group to pass status checks
+        if not self.wait_for_condition_or_timeout(
+            lambda: self.verify_asg_status_checks(groups, termination_ids),
+            self.config['ec2win'][calling_component].get('timeout_inst_status_check', 300),
+            pre_check=True
+        ):
+            raise Exception("Timed out waiting for new instances to pass status check for component {}".format(calling_component))
             
     # Unlike the other validators, this will return a list of failing instances to facilitate their termination
     def get_failed_adjust_insts(self, described_instances, endpoint_frmtstr, encoder_method, settings_to_verify):
@@ -439,7 +526,10 @@ class Ec2WinDriver(Adjust):
                 raw_data = raw_data[len(codecs.BOM_UTF16_LE):] # remove BOM
                 describe_data = raw_data.decode('utf_16_le')
             else:
-                raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
+                failed_instances.append(i["InstanceId"])
+                continue
+                # TODO: log this
+                # raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
 
             # The failures we're concerned with here-in are limited to IIS failing to deploy and producing 500 error codes and the json never being available
             # Misalignment of settings would be indicative of some other type of issue so it produces an error accordingly
