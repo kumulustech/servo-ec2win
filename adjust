@@ -153,25 +153,25 @@ class Ec2WinDriver(Adjust):
             settings = data['application']['components'].pop(component_key, {}).get('settings')
             if not settings:
                 continue # no settings for this component
-            self.progress_message = "adjusting {} component. Encoding windows settings".format(component_key)
+            self.progress_message = "adjusting {} component. Encoding settings".format(component_key)
             self.print_progress()
 
             import encoders.base as enc
             script = enc.encode(self.config['ec2win'][component_key]['encoder'], settings)[0]
             
             # NOTE: counting of windows settings is based on all settings starting with "Set-", may need to add new encoder func if this changes
-            size = len(script.split('Set-')) - 1
+            # size = len(script.split('Set-')) - 1
             # Adjust windows settings
-            if size > 0:
+            # if size > 0:
                 # self.progress = 25
-                self.progress_message = "encoded {} windows settings, uploading powershell script to bucket".format(size)
-                self.print_progress()
+            self.progress_message = "encoded settings, uploading script to bucket"
+            self.print_progress()
 
-                script_bytes = script.encode()
-                self.s3.put_object(Body=script_bytes, Bucket=self.config['ec2win'][component_key]['s3_bucket'], Key=self.config['ec2win'][component_key]['s3_path'])
+            script_bytes = script.encode()
+            self.s3.put_object(Body=script_bytes, Bucket=self.config['ec2win'][component_key]['s3_bucket'], Key=self.config['ec2win'][component_key]['s3_path'])
 
             # self.progress = 50
-            self.progress_message = "adjusted {} windows settings".format(size)
+            self.progress_message = "adjusted settings"
             self.print_progress()
         
             # Adjust ASG launch template if needed
