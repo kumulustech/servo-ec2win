@@ -11,26 +11,54 @@ adjust_json_stdin = '''\
         "components": {
             "web": {
                 "settings": {
-                    "AlwaysPreTouch": { "value": 0.0 },
-                    "CMSInitiatingOccupancyFraction": { "value": 92.0 },
-                    "CMSParallelRemarkEnabled": { "value": 0.0 },
-                    "CMSScavengeBeforeRemark": { "value": 0.0 },
-                    "ExplicitGCInvokesConcurrent": { "value": 0.0 },
-                    "MaxHeapSize": { "value": 1.0 },
-                    "ParallelRefProcEnabled": { "value": 0.0 },
-                    "ScavengeBeforeFullGC": { "value": 0.0 },
-                    "UnlockExperimentalVMOptions": { "value": 0.0 },
-                    "UseCGroupMemoryLimitForHeap": { "value": 0.0 },
-                    "UseCMSInitiatingOccupancyOnly": { "value": 0.0 },
-                    "UseStringDeduplication": { "value": 0.0 },
-                    "inst_type": { "value": "t2.small" }
+                    "UriEnableCache": {"value": 1},
+                    "UriScavengerPeriod": {"value": 260},
+                    "WebConfigCacheEnabled": {"value": 0},
+                    "WebConfigEnableKernelCache": {"value": 1},
+                    "inst_type": {"value": "t2.micro"}
+                }
+            },
+            "app": {
+                "settings": {
+                    "UriEnableCache": {"value": 1},
+                    "UriScavengerPeriod": {"value": 260},
+                    "WebConfigCacheEnabled": {"value": 0},
+                    "WebConfigEnableKernelCache": {"value": 1},
+                    "inst_type": {"value": "t2.micro"}
                 }
             }
         }
-    },
-    "control": {}
+    }
 }
 '''
+
+# jvm test data
+# '''\
+# {
+#     "application": {
+#         "components": {
+#             "web": {
+#                 "settings": {
+#                     "AlwaysPreTouch": { "value": 0.0 },
+#                     "CMSInitiatingOccupancyFraction": { "value": 92.0 },
+#                     "CMSParallelRemarkEnabled": { "value": 0.0 },
+#                     "CMSScavengeBeforeRemark": { "value": 0.0 },
+#                     "ExplicitGCInvokesConcurrent": { "value": 0.0 },
+#                     "MaxHeapSize": { "value": 1.0 },
+#                     "ParallelRefProcEnabled": { "value": 0.0 },
+#                     "ScavengeBeforeFullGC": { "value": 0.0 },
+#                     "UnlockExperimentalVMOptions": { "value": 0.0 },
+#                     "UseCGroupMemoryLimitForHeap": { "value": 0.0 },
+#                     "UseCMSInitiatingOccupancyOnly": { "value": 0.0 },
+#                     "UseStringDeduplication": { "value": 0.0 },
+#                     "inst_type": { "value": "t2.small" }
+#                 }
+#             }
+#         }
+#     },
+#     "control": {}
+# }
+# '''
 
 def test_version(monkeypatch):
     with monkeypatch.context() as m:
