@@ -23,7 +23,7 @@ RUN mkdir encoders/
 ADD https://raw.githubusercontent.com/opsani/servo/master/servo \
     https://raw.githubusercontent.com/opsani/servo/master/adjust.py \
     https://raw.githubusercontent.com/opsani/servo/master/measure.py \
-    https://raw.githubusercontent.com/kumulustech/servo-ec2win/feature-servo-ec2jvm/adjust \
+    https://raw.githubusercontent.com/kumulustech/servo-ec2win/master/adjust \
     https://raw.githubusercontent.com/opsani/servo-ab/master/measure \
     /servo/
 
