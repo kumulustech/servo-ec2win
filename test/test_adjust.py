@@ -32,6 +32,34 @@ adjust_json_stdin = '''\
 }
 '''
 
+# jvm test data
+# '''\
+# {
+#     "application": {
+#         "components": {
+#             "web": {
+#                 "settings": {
+#                     "AlwaysPreTouch": { "value": 0.0 },
+#                     "CMSInitiatingOccupancyFraction": { "value": 92.0 },
+#                     "CMSParallelRemarkEnabled": { "value": 0.0 },
+#                     "CMSScavengeBeforeRemark": { "value": 0.0 },
+#                     "ExplicitGCInvokesConcurrent": { "value": 0.0 },
+#                     "MaxHeapSize": { "value": 1.0 },
+#                     "ParallelRefProcEnabled": { "value": 0.0 },
+#                     "ScavengeBeforeFullGC": { "value": 0.0 },
+#                     "UnlockExperimentalVMOptions": { "value": 0.0 },
+#                     "UseCGroupMemoryLimitForHeap": { "value": 0.0 },
+#                     "UseCMSInitiatingOccupancyOnly": { "value": 0.0 },
+#                     "UseStringDeduplication": { "value": 0.0 },
+#                     "inst_type": { "value": "t2.small" }
+#                 }
+#             }
+#         }
+#     },
+#     "control": {}
+# }
+# '''
+
 def test_version(monkeypatch):
     with monkeypatch.context() as m:
         # replicate command line arguments fed in by servo
