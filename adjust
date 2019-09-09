@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import collections
 import os
 import time
@@ -7,6 +8,7 @@ import urllib.request
 import socket # for handling timeout
 import sys
 import codecs # Used for handling utf16 le BOM
+import re
 
 import yaml
 import boto3 # AWS SDK
@@ -171,28 +173,17 @@ class Ec2WinDriver(Adjust):
         
             # Adjust ASG launch template if needed
             groups = self.config["ec2win"][component_key]["asg"].split(",")
-
             changed_lst = []
             new_inst_type = settings.get('inst_type')
             if new_inst_type:
                 new_inst_type_val = new_inst_type.get("value")
                 if not new_inst_type_val:
                     raise Exception("No 'value' key provided inst_type dict")
-
-                for g in groups:
-                    asg_lt_info = self.query_asg_launch_template(g) # tuple [3]
-
-                    if new_inst_type_val == asg_lt_info[0]:
-                        continue # current template version has same instance type
-
-                    new_lt_data = { "InstanceType": new_inst_type_val }
-                    self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=str(asg_lt_info[2]), LaunchTemplateData=new_lt_data)
-                    # Done here. NOTE: assumes ASG is configured to reference latest launch template
-                    changed_lst.append(g)
+                changed_lst = self.update_asg_instance_types(groups, new_inst_type_val)
 
             size = len(changed_lst)
             # self.progress = 60
-            self.progress_message = "adjusted {} asg launch templates".format(size)
+            self.progress_message = "adjusted {} asg instance types".format(size)
             self.print_progress()
 
             # Terminate batch_size instances in each group belonging to the component, wait for ready before terminating next batch
@@ -474,6 +465,92 @@ class Ec2WinDriver(Adjust):
         
         return True
 
+    def query_asg_launch_info(self, gname):
+        g = self.get_asg_info(gname)
+        launch_template = g.get("LaunchTemplate")
+        if launch_template:
+            args = launch_template.copy()
+            if "LaunchTemplateId" in args:
+                args.pop("LaunchTemplateName",None) # keep only one of Id or Name in the args
+            args["Versions"] =  [args.pop("Version","$Latest")]
+            cur_template_ver = self.ec2.describe_launch_template_versions(**args)['LaunchTemplateVersions'][0] # should be only one
+
+            return ( 
+                cur_template_ver["LaunchTemplateData"]["InstanceType"],
+                launch_template["LaunchTemplateName"],
+                cur_template_ver["VersionNumber"],
+                'template'
+            )
+        else:
+            launch_config_name = g.get("LaunchConfigurationName",None)
+            if launch_config_name is None:
+                raise Exception("Could not retrieve launch template or config for group {}.".format(gname))
+
+            launch_config = self.asg.describe_launch_configurations(LaunchConfigurationNames=[launch_config_name])["LaunchConfigurations"][0]
+            launch_config_version = 0
+            ver_match = re.search(r'\d+$', launch_config_name)
+            if ver_match:
+                launch_config_version = int(ver_match.group(0))
+                launch_config_name = launch_config_name[:-len(ver_match.group(0))]
+            else:
+                self.print_json_error(
+                    "none",
+                    "warning",
+                    "found launch config name with no appended version: '{}'. New config will start at version 1".format(launch_config_name)
+                )
+                
+            return (
+                launch_config["InstanceType"],
+                launch_config_name,
+                launch_config_version,
+                'config',
+                launch_config
+            )
+
+    def update_asg_instance_types(self, groups, new_inst_type):
+        changed_lst = []
+        for g in groups:
+            asg_lt_info = self.query_asg_launch_info(g) # tuple [3]
+
+            if new_inst_type == asg_lt_info[0]:
+                continue # current template version has same instance type
+            
+            changed_lst.append(g)
+            if asg_lt_info[3] == 'template':
+                new_lt_data = { "InstanceType": new_inst_type }
+                self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=str(asg_lt_info[2]), LaunchTemplateData=new_lt_data)
+                # Done here. NOTE: assumes ASG is configured to reference latest launch template
+            elif asg_lt_info[3] == 'config':
+                # Update launch config
+                new_lc_version = asg_lt_info[2] + 1
+                new_lc_name = '{}{}'.format(asg_lt_info[1],new_lc_version)
+                old_lc_name = asg_lt_info[4]["LaunchConfigurationName"]
+                new_lc = asg_lt_info[4]
+                # Fix or remove props which fail param validation
+                new_lc["UserData"] = base64.b64decode(new_lc["UserData"]) # kinda silly that we have to do this ¯\_(ツ)_/¯
+                new_lc.pop("LaunchConfigurationARN")
+                new_lc.pop("CreatedTime")
+                if new_lc["RamdiskId"] == '':
+                    new_lc.pop("RamdiskId")
+                if new_lc["KernelId"] == '':
+                    new_lc.pop("KernelId")
+
+                new_lc["LaunchConfigurationName"] = new_lc_name
+                new_lc["InstanceType"] = new_inst_type
+                self.asg.create_launch_configuration(**new_lc)
+                # Update asg to use new config
+                self.asg.update_auto_scaling_group(AutoScalingGroupName=g, LaunchConfigurationName=new_lc_name)
+                self.asg.delete_launch_configuration(LaunchConfigurationName=old_lc_name)
+
+            else:
+                raise Exception("Unexpected value found for launch info source. Supported: config, template. Found: {}. asg_lt_info: {}".format(
+                    asg_lt_info[3],
+                    asg_lt_info
+                )
+            )
+
+        return changed_lst
+
     def terminate_instances_and_wait_for_status_checks(self, termination_ids, groups, calling_component):
         # Terminate instances
         resp = self.ec2.terminate_instances(InstanceIds = termination_ids)
@@ -592,12 +669,15 @@ class Ec2WinDriver(Adjust):
             inst_vals = it_settings.get('values', list(INST_TYPES))
             it_type = it_settings.get('type', 'enum')
             it_unit = it_settings.get('unit', 'ec2')
+            inst_types = set()
             for gname in groups:
-                val = self.query_asg_launch_template(gname)[0]
-                retVal['application']['components'][component_key]['settings']["inst_type"] = { "value" : val, "type" : it_type, "values" : inst_vals, "unit" : it_unit }
+                inst_types.add(self.query_asg_launch_info(gname)[0])
                 if(ref_groups):
                     tgt_insts.extend(self.get_asg_instances(gname))
         
+            inst_type = "(multiple)" if len(inst_types) > 1 else inst_types.pop()
+            retVal['application']['components'][component_key]['settings']["inst_type"] = { "value" : inst_type, "type" : it_type, "values" : inst_vals, "unit" : it_unit }
+                
 
             if ref_groups:
                 for gname in ref_groups:
@@ -609,28 +689,6 @@ class Ec2WinDriver(Adjust):
                 }
         
         return retVal
-
-    def query_asg_launch_template(self, gname):
-        a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
-        if not a.get("AutoScalingGroups"):
-            raise Exception("Auto-scaling Group {} does not exist".format(gname))
-        g = a["AutoScalingGroups"][0]
-        launch_template = g.get("LaunchTemplate")
-        if launch_template is None:# must be able to retrieve launch template. Launch configs are not as programatically flexible, thus are not supported (yet)
-            raise Exception("Could not retrieve launch template for group {}. This driver does not currently support updating instance types of launch groups".format(gname))
-            
-        
-        args = launch_template.copy()
-        if "LaunchTemplateId" in args:
-            args.pop("LaunchTemplateName",None) # keep only one of Id or Name in the args
-        args["Versions"] =  [args.pop("Version","$Latest")]
-        cur_template_ver = self.ec2.describe_launch_template_versions(**args)['LaunchTemplateVersions'][0] # should be only one
-
-        return ( 
-            cur_template_ver["LaunchTemplateData"]["InstanceType"],
-            launch_template["LaunchTemplateName"],
-            cur_template_ver["VersionNumber"]
-        )
 
 
     def encode_describe_if_needed(self, name, data, value):
