@@ -1,42 +1,19 @@
 # Optune Servo with ec2win (adjust) and apache benchmark (measure) drivers
 
-## Build servo container (from project top dir)
+1. Echo optune token into docker secret: `echo -n 'YOUR AUTH TOKEN' | docker secret create optune_auth_token -`
+1. Run `docker build servo/ -t example.com/servo-ec2win-ab`
+1. Referring to `config.yaml.example` create file `config.yaml` in driver's folder. It will contain settings you'd want to make adjustable on your Windows Server instance.
+1. Create `.aws` folder with needed credential and permission
+1. Create a docker service:
+
 ```
-docker build servo/ -t example.com/servo-ec2win-ab
-```
-
-## Running servo as a Docker service
-
-### Create a docker secret with your authentication token
-```
-echo -n 'myToken'|docker secret create optune_auth_token -
-```
-
-### Run Servo (as a docker service)
-**@@TBD**:  create/mount secrets for `newrelic_account_id`, `newrelic_apm_api_key`, `newrelic_apm_app_id`, `newrelic_insights_query_key`, and the servo `config.yaml`.  
-
-**IMPORTANT** Update the example commands below as needed, e.g., to bind mount config.yaml:  `--mount type=bind,source=/path/to/config.yaml,destination=/servo/config.yaml`
-**DEV/IMPORTANT** When running outside of EC2, Update the example commands below as needed, e.g., to bind mount an aws config directory:  `--mount type=bind,source=/path/to/.aws/,destination=/root/.aws/`
-
-<!-- ```
-docker service create -t --name optune-servo \
+docker service create -t
+    --name DOCKER_SERVICE_NAME \
     --secret optune_auth_token \
-    example.com/servo-ec2asg-newrelic \
-    app1 --account myAccount
-```
-
-If you named your docker secret anything other than `optune_auth_token`, then specify the path to it:
-```
-docker service create -t --name optune-servo \
-    --secret acme-app1-auth \
-    example.com/servo-ec2asg-newrelic \
-    app1 --account myAccount  --auth-token /run/secrets/acme-app1-auth
-``` -->
-```
-TEST_ENDPOINT=x.x.x.x # ec2 IP
-docker service create -t --name optune-servo \
-    --env AB_TEST_URL=http://$TEST_ENDPOINT/ \
-    --secret optune_auth_token \
+    --env AB_TEST_URL= APACHED_BENCHMARK_URL \
+    --mount type=bind,source=/PATH/TO/config.yaml,destination=/servo/config.yaml \
+    --mount type=bind,source=/PATH/TO/.aws/,destination=/root/.aws/ \
     example.com/servo-ec2win-ab \
-    app1 --account myAccount
+    APP_NAME  \
+    --account USER_ACCOUNT \
 ```
