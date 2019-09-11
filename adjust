@@ -524,7 +524,7 @@ class Ec2WinDriver(Adjust):
                 # Update launch config
                 new_lc_version = asg_lt_info[2] + 1
                 new_lc_name = '{}{}'.format(asg_lt_info[1],new_lc_version)
-                old_lc_name = asg_lt_info[4]["LaunchConfigurationName"]
+                # old_lc_name = asg_lt_info[4]["LaunchConfigurationName"] # TODO verify against cached info to safely delete
                 new_lc = asg_lt_info[4]
                 # Fix or remove props which fail param validation
                 new_lc["UserData"] = base64.b64decode(new_lc["UserData"]) # kinda silly that we have to do this ¯\_(ツ)_/¯
@@ -540,7 +540,7 @@ class Ec2WinDriver(Adjust):
                 self.asg.create_launch_configuration(**new_lc)
                 # Update asg to use new config
                 self.asg.update_auto_scaling_group(AutoScalingGroupName=g, LaunchConfigurationName=new_lc_name)
-                self.asg.delete_launch_configuration(LaunchConfigurationName=old_lc_name)
+                # self.asg.delete_launch_configuration(LaunchConfigurationName=old_lc_name) # TODO verify against cached info to safely delete
 
             else:
                 raise Exception("Unexpected value found for launch info source. Supported: config, template. Found: {}. asg_lt_info: {}".format(
