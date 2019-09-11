@@ -14,6 +14,56 @@ When the `describe_endpoint` is configured in config.yaml, it must point to a we
 
 When `describe_endpoint` is used with the dotnet encoder, the endpoint contains resulting json from the ps1 script produced by the `encode_describe` method of said dotnet encoder class. __Note__ as new Windows settings are added, their respective `encode_describe` methods must also be implemented in order to keep the describe.ps1 script produced by the encoder up to date. See `describe_endpoint_dotnet.ps1.example` and `user_data_dotnet.example` for usage
 
+## Required IAM Permissions
+
+All hosts that reference the config file should have an IAM role (instance profile) configured with a policy to allow read only access to the desired bucket path. For example:
+
+```
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": [
+                "s3:Get*",
+                "s3:List*"
+            ],
+            "Resource": [
+                "arn:aws:s3:::example-bucket.example.com/ws2012-sandbox/*",
+                "arn:aws:s3:::example-bucket.example.com"
+            ]
+        }
+    ]
+}
+```
+
+As for the account provided for the servo, the permissions required are:
+
+EC2 Permissions
+
+- ec2:DescribeInstances - can be exluded if describe_endpoint is not used
+- ec2:TerminateInstances
+- ec2:DescribeLaunchTemplateVersions - can be exluded when using only launch configs
+- ec2:CreateLaunchTemplateVersion - can be exluded when using only launch configs
+- ec2:DescribeInstanceStatus
+
+IAM Permissions
+
+- iam:PassRole - Must apply to the readonly role detailed above, can be exluded when only launch templates are used or if launch configs do not specify an instance profile
+
+S3 Permissions; For updating and parsing adjust file in s3, can be excluded if only adjusting instance type
+
+- s3:PutObject
+- s3:GetObject
+
+Autoscaling Permissions
+
+- autoscaling:CreateLaunchConfiguration - can be exluded when using only launch templates
+- autoscaling:DescribeAutoScalingGroups
+- autoscaling:DescribeLaunchConfigurations - can be exluded when using only launch templates
+- autoscaling:UpdateAutoScalingGroup - can be exluded when using only launch templates
+
 ## Installation (encoder-dotnet)
 
 1. Echo optune token into docker secret: `echo -n 'YOUR AUTH TOKEN' | docker secret create optune_auth_token -`
