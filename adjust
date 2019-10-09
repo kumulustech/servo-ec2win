@@ -56,7 +56,9 @@ class Ec2WinDriver(Adjust):
 
     @staticmethod
     def check_config(config):
-        if not os.path.isdir('/root/.aws') and not os.path.isdir('{}/.aws'.format(os.path.expanduser('~'))):
+        if not os.path.isdir('/root/.aws') \
+        and not os.path.isdir('{}/.aws'.format(os.path.expanduser('~'))) \
+        and not os.popen("curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/").read():
             assert os.environ.get('AWS_ACCESS_KEY_ID', '') != '' and os.environ.get('AWS_SECRET_ACCESS_KEY', '') != '', 'No Amazon S3 access key was provided. ' \
                                             'Please refer to README.md.'
             assert os.environ.get('AWS_DEFAULT_REGION', '') != '', 'No Amazon S3 default region was provided. ' \
@@ -433,6 +435,7 @@ class Ec2WinDriver(Adjust):
         return True
 
     def get_asg_info(self, gname):
+        # TODO: paginate response
         a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
         # describe_auto_.. doesn't fail if asg not found, check for it:
         if not a.get("AutoScalingGroups"):
