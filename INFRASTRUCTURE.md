@@ -11,10 +11,10 @@ For the sake of simplicity, the servo-ec2win driver was designed to adjust alrea
         s3_path: servo-ec2win/adjust.ps1
         ```
 
-- Launch Data - Instance configuration template that an Auto Scaling group uses to launch EC2 instances. There are two kinds
+- Launch Data - Instance configuration template that an Auto Scaling group uses to launch EC2 instances. There are two types; you will only need one of them:
     - Launch Config - No versioning supported. During adjust, new launch config with incremented version number appended to name will be generated with non-adjustment values copied from the previous config
     - Launch Template - Supports versioning, driver generates new version of template during adjust
-    - UserData Script - Regardless of Launch Data type, it must include a UserData script to download the file hosted at `s3_path` on `s3_bucket` and execute it. See user_data_dotnet.example
+        - UserData Script - __Note__ Regardless of Launch Data type, it must include a UserData script to download the file hosted at `s3_path` on `s3_bucket` and execute it. See user_data_dotnet.example
 
 - Autoscaling Group(s) - An Auto Scaling group contains a collection of Amazon EC2 instances that are treated as a logical grouping for the purposes of automatic scaling and management
     - __Note__ the `asg` setting of config.yaml must be set to a comma seperated list of one or more Autoscaling group names whose instances are to be adjusted
