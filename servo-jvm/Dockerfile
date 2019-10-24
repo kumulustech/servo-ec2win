@@ -6,6 +6,7 @@ WORKDIR /servo
 # Install dependencies
 RUN pip3 install requests PyYAML python-dateutil boto3 && \
 	apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     apache2-utils \
     python3-boto \
     python3-botocore
