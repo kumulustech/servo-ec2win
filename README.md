@@ -1,4 +1,3 @@
-# TODO: remove ec2s3 artifacts
 # servo-ec2win
 
 _Optune adjust driver for EC2 Instances_
