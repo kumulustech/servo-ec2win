@@ -1,28 +1,32 @@
 ---
 ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what should it be)
   web:             # this is the name of the VM's role: web, app, etc.
-    s3_bucket: xxx  # Bucket where settings script is stored
-    s3_path: yyy  # Path where settings script is stored within bucket
-    # describe_port: 8080
-    # describe_endpoint: 'describe.json'
-    # ec2_ip: zzz.zzz.zzz.zzz
-    asg: aaa
-    # ref_asg: bbb
-    # batch_size: 1
-    # timeout_adjust_per_batch: 720
-    # timeout_inst_create: 300
-    # timeout_inst_status_check: 300
-    # timeout_inst_adjust_validated: 300
-    # batch_cooldown: 300
-    # settings:
-    #   inst_type:
-    #     type": 'enum'
-    #     unit: 'ec2'
-    #     values:
-    #     - 't2.nano'
-    #     - 't2.micro'
-    #     - 't2.small'
-    encoder: 
+    asg: aaa,bbb      # Specify the target ASG(s) here. The driver will update their instance types and terminate them to enact the changes
+    ref_asg: ccc      # Specify reference ASG(s) here. No changes will be applied to them, they are used to identify the control group instances
+    batch_size: 2     # How many instances to terminate per batch
+    validator:        # Config section for external validator 
+      filename: 01ec2s3   # Filename to import validator from
+      # component: web    # Component from which validation driver derives its config. Default value is the component under which this config section resides ('web' in this case)
+    timeout_adjust_per_batch: 1560      # Total time to wait for each batch to terminate and new instances to become ready before timing out
+    timeout_inst_create: 600            # How long to wait for the new instances to be created before timing out
+    timeout_inst_status_check: 600      # How long to wait for the new instances to become ready before timing out
+    timeout_inst_adjust_validated: 300  # How long to wait for the new instances to pass external validation before timing out
+    # batch_cooldown: 120               # If no validator is specified, the driver will wait this long instead
+    settings:
+      inst_type:
+        values:       # The list of instance types to be used in adjustment and measurement by the servo
+        - 't2.nano'
+        - 't2.micro'
+        - 't2.small'
+
+ec2s3:  # Configuration of the validator driver must be included when used (generally this will not require extra setup as the validation driver will usually be run prior to ec2win by servo-agg)
+  web:  # this is the name of the VM's role: web, app, etc.
+    s3_bucket: bucket.name.here  # Bucket where settings script is stored
+    s3_path: path-to/adjust.ps1  # Path where settings script is stored within bucket
+    describe_port: 8080                 # Port on which the describe endpoint is exposed
+    describe_endpoint: 'describe.json'  # Path used to retrieve describe endpoint data from hosts
+    describe_encoding: utf-16           # Encoding of describe endpoint data
+    encoder:
       name: dotnet
       settings:
         UriEnableCache: 
@@ -35,8 +39,3 @@ ec2win:            # this matches the driver name, e.g., dotnet, iis, etc. (what
           default: 0
         WebConfigEnableKernelCache:
           default: 1
-  app:             # this is the name of the VM's role: web, app, etc.
-    s3_bucket: 111  # Bucket where settings script is stored
-    s3_path: 222  # Path where settings script is stored within bucket
-
-    etc... same as 'web' above

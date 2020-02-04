@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
+
 import base64
-import collections
+import importlib.machinery
 import os
-import time
-import io
-import urllib.request
-import socket # for handling timeout
-import sys
-import codecs # Used for handling utf16 le BOM
 import re
+import subprocess
+import time
+import types
 
 import yaml
 import boto3 # AWS SDK
-# if this is running in the pytest suite, symlink destination names have been adjusted to make importing easier
-if 'pytest' in sys.modules:
-    from base_adjust import Adjust  # adjust.py renamed to base adjust to allow this file to be imported normally for testing
-else:
-    from adjust import Adjust
+
+from adjust import Adjust
 
 DESC = "EC2 Windows Server adjust driver for Opsani Optune"
 VERSION = "0.0.5"
 HAS_CANCEL = False
 
+CONFIG_KEY = 'ec2win'
 INST_TYPES=('t2.nano','t2.micro','t2.small','t2.medium','t2.large','t2.xlarge','t2.2xlarge','m4.large','m4.xlarge','m4.2xlarge','m4.4xlarge','m4.10xlarge','m4.16xlarge','r4.large','r4.xlarge','r4.2xlarge','r4.4xlarge','r4.8xlarge','r4.16xlarge','x1.16xlarge','x1.32xlarge','x1e.xlarge','x1e.2xlarge','x1e.4xlarge','x1e.8xlarge','x1e.16xlarge','x1e.32xlarge','i2.xlarge','i2.2xlarge','i2.4xlarge','i2.8xlarge','i3.large','i3.xlarge','i3.2xlarge','i3.4xlarge','i3.8xlarge','i3.16xlarge','i3.metal','c4.large','c4.xlarge','c4.2xlarge','c4.4xlarge','c4.8xlarge','c5.large','c5.xlarge','c5.2xlarge','c5.4xlarge','c5.9xlarge','c5.18xlarge','c5d.large','c5d.xlarge','c5d.2xlarge','c5d.4xlarge','c5d.9xlarge','c5d.18xlarge','g3.4xlarge','g3.8xlarge','g3.16xlarge','p2.xlarge','p2.8xlarge','p2.16xlarge','p3.2xlarge','p3.8xlarge','p3.16xlarge','d2.xlarge','d2.2xlarge','d2.4xlarge','d2.8xlarge','m5.large','m5.xlarge','m5.2xlarge','m5.4xlarge','m5.12xlarge','m5.24xlarge','m5d.large','m5d.xlarge','m5d.2xlarge','m5d.4xlarge','m5d.12xlarge','m5d.24xlarge','h1.2xlarge','h1.4xlarge','h1.8xlarge','h1.16xlarge',)
-CONFIG_FILE_SETTINGS=('s3_bucket', 's3_path', 'describe_port', 'describe_endpointdescribe_endpoint', 'ec2_ip')
 
 config_path = os.environ.get('OPTUNE_CONFIG', './config.yaml')
-
-def dict_merge(d, m):
-    for k, _ in m.items():
-        if k in d and isinstance(d[k], dict) and isinstance(m[k], collections.Mapping):
-            dict_merge(d[k], m[k])
-        else:
-            d[k] = m[k]
-
 
 class Ec2WinDriver(Adjust):
     def __init__(self, *args, **kwargs):
@@ -41,8 +28,7 @@ class Ec2WinDriver(Adjust):
         if not (self.args.info or self.args.version):
             self.config = self.load_config()
             self.check_config(self.config)
-            self.s3 = boto3.client('s3') # credentials are retreieved from env vars or /root/.aws
-            self.ec2 = boto3.client('ec2')
+            self.ec2 = boto3.client('ec2') # credentials are retreieved from env vars, /root/.aws, or aws ec2 meta-data api
             self.asg = boto3.client('autoscaling')
 
     @staticmethod
@@ -58,179 +44,200 @@ class Ec2WinDriver(Adjust):
     def check_config(config):
         if not os.path.isdir('/root/.aws') \
         and not os.path.isdir('{}/.aws'.format(os.path.expanduser('~'))) \
-        and not os.popen("curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/").read():
+        and not subprocess.run(['curl', '-s', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/'], stdout=subprocess.PIPE).stdout:
             assert os.environ.get('AWS_ACCESS_KEY_ID', '') != '' and os.environ.get('AWS_SECRET_ACCESS_KEY', '') != '', 'No Amazon S3 access key was provided. ' \
                                             'Please refer to README.md.'
             assert os.environ.get('AWS_DEFAULT_REGION', '') != '', 'No Amazon S3 default region was provided. ' \
                                             'Please refer to README.md.'
 
         c = config
-        assert c and c.get('ec2win', None), 'EC2 Server Configuration was not provided in "{}". ' \
-                                        'Please refer to README.md'.format(config_path)
+        assert c and c.get(CONFIG_KEY), 'EC2 Win Configuration was not provided under key "{}" in "{}". ' \
+                                        'Please refer to README.md'.format(CONFIG_KEY, config_path)
 
-        top_level = c.get('ec2win')
-        assert len(top_level) > 0, 'Component Configuration was not provided in "{}". ' \
-                                        'Please refer to README.md'.format(config_path)
-        assert isinstance(top_level, dict), 'Component Configuration was malformed in "{}". ' \
-            'Expected dict, found {}'.format(config_path, top_level.__class__.__name__)
+        top_level = c[CONFIG_KEY]
+        assert len(top_level) > 0, 'No component configurations were provided under key "{}" in "{}". ' \
+                                        'Please refer to README.md'.format(CONFIG_KEY, config_path)
+        assert isinstance(top_level, dict), 'Components configuration was malformed under key "{}" in "{}". ' \
+            'Expected dict, found {}'.format(CONFIG_KEY, config_path, top_level.__class__.__name__)
 
         config_asgs = set()
         ref_component = '' # string: if ref_asg defined, this is set to component name
-        for component_key in top_level:
-            component_val = top_level[component_key]
-            assert isinstance(component_val, dict), 'Invalid config section for component {}. Expected dict, found {}'.format(
-                component_key, component_val.__class__.__name__
+        for component_key, component_val in top_level.items():
+            error_preamble = 'Component {} in "{}":'.format(component_key, config_path)
+
+            assert isinstance(component_val, dict), '{} Invalid config section. Expected dict, found {}'.format(
+                error_preamble, component_val.__class__.__name__
             )
 
-            # assert component_val.get('encoder', None), 'Section "encoder" was not provided in "{}". ' \
-            #                                 'Please refer to README.md.'.format(config_path)
-            enc = component_val.get('encoder', None)
-            if not enc:
-                incompat_settings = set(component_val.keys()).intersection(CONFIG_FILE_SETTINGS)
-                assert len(incompat_settings) < 1, 'Incompatible config items found due to lack of encoder: {}'.format(incompat_settings)
-            else:
-                assert component_val.get('s3_bucket', None), 'Amazon S3 bucket name was not provided in "{}". ' \
-                                                'Please refer to README.md.'.format(config_path)
-                assert isinstance(component_val['s3_bucket'], str), 'Amazon S3 bucket name must be a string'
-                assert component_val.get('s3_path', None), 'Amazon S3 path was not provided in "{}". ' \
-                                                'Please refer to README.md.'.format(config_path)
-                assert isinstance(component_val['s3_path'], str), 'Amazon S3 path must be a string'
-
-                dprt = component_val.get('describe_port', None)
-                if dprt:
-                    assert (isinstance(dprt, str) and (0 < int(dprt) <= 65535)) or (isinstance(dprt, int) and (0 < dprt <= 65535)), \
-                    'Describe port must be a valid port number when provided'
-
-                de = component_val.get('describe_endpoint', None)
-                if de:
-                    assert isinstance(de, str), 'Describe endpoint must be a string containing path to describe when provided'
-                
-
-                ei = component_val.get('ec2_ip', None)
-                if ei: # Minimal validation since this is mostly for debug using a single instance, should warn in production if still part of codebase
-                    assert isinstance(ei, str), 'EC2 Ip must be a string containing IP address when provided'
-
-            it = component_val.get('inst_types', None)
+            it = component_val.get('settings', {}).get('inst_type')
             if it:
-                assert isinstance(it, list) and len(it) > 0, 'Instance types must be a (>0 length) list when provided'
-                assert all(isinstance(t, str) for t in it), 'All instance types must be string values when provided'
+                if it.get('type'):
+                    assert it['type'] == 'enum', \
+                        '{} inst_type setting "type" must be "enum" when provided. Found {}'.format(error_preamble, it.get('type'))
+                assert isinstance(it.get('values'), list) and len(it) > 0, \
+                    '{} Instance types must be a (>0 length) list when provided'.format(error_preamble)
+                assert all(isinstance(t, str) for t in it['values']), \
+                    '{} All instance type values must be type string when provided'.format(error_preamble)
 
-            a = component_val.get('asg', None)
-            assert a, 'One or more Auto Scaling Group names must be provided to facilitate updating of launch config'
-            assert isinstance(a, str), 'Target ASGs must be a string value (comma sperated for multiple values)'
+            asgs = component_val.get('asg')
+            assert asgs and isinstance(asgs, str), '{} One or more ASGs must be specified '\
+                'as a string value (comma sperated for multiple values). Found {}'.format(error_preamble, asgs)
 
             comp_asgs = set()
-            for asg in a.split(','):
-                assert asg not in config_asgs, 'Target ASG {} was found under multiple roles/components which may produce undesired behaviour'.format(asg)
-                assert asg not in comp_asgs, 'Target ASG {} was defined twice in a single role/component which may produce undesired behaviour'.format(asg)
+            for asg in asgs.split(','):
+                assert asg not in config_asgs, '{} Config malformed; Target ASG {} was found under multiple roles/components '\
+                    ''.format(error_preamble, asg)
+                assert asg not in comp_asgs, '{} Config malformed; Target ASG {} was defined twice in a single role/component '\
+                    ''.format(error_preamble, asg)
                 comp_asgs.add(asg)
 
             config_asgs.update(comp_asgs)
 
-            ra = component_val.get('ref_asg', None)
+            ra = component_val.get('ref_asg')
             if ra:
-                assert ref_component == '', 'Reference ASG already defined in component {} cannot be redefined in component {}'.format(ref_component, component_key)
-                assert isinstance(ra, str), 'Reference ASGs must be a string value (comma sperated for multiple values)'
+                assert ref_component == '', '{} Reference ASG already defined in component {} cannot be redefined'.format(error_preamble, ref_component)
+                assert isinstance(ra, str), '{} Reference ASGs must be a string value (comma sperated for multiple values). Found {}'.format(error_preamble, ra)
                 ref_component = component_key
             
-            bs = component_val.get('batch_size', None)
+            bs = component_val.get('batch_size')
             if bs:
-                assert isinstance(bs, int) and bs > 0, 'Batch size must be a (>0) integer when provided'
-
-            tapb = component_val.get('timeout_adjust_per_batch', None)
-            if tapb:
-                assert isinstance(tapb, int) and bs > 0, 'Time out per batch must be a (>0) integer when provided'
-
-            tic = component_val.get('timeout_inst_create', None)
-            if tic:
-                assert isinstance(tic, int) and bs > 0, 'Time out for instance creation must be a (>0) integer when provided'
-
-            tisc = component_val.get('timeout_inst_status_check', None)
-            if tisc:
-                assert isinstance(tisc, int) and bs > 0, 'Time out for instance status checks must be a (>0) integer when provided'
+                assert isinstance(bs, int) and bs > 0, '{} Batch size must be a (>0) integer when provided. Found {}'.format(error_preamble, bs)
             
-            bc = component_val.get('batch_cooldown', None)
+            # Timeouts
+            tapb = component_val.get('timeout_adjust_per_batch')
+            if tapb:
+                assert isinstance(tapb, int) and tapb > 0, '{} Time out per batch must be a (>0) integer when provided. Found {}'.format(error_preamble, tapb)
+
+            tic = component_val.get('timeout_inst_create')
+            if tic:
+                assert isinstance(tic, int) and tic > 0, '{} Time out for instance creation must be a (>0) integer when provided. Found {}'.format(error_preamble, tic)
+
+            tisc = component_val.get('timeout_inst_status_check')
+            if tisc:
+                assert isinstance(tisc, int) and tisc > 0, '{} Time out for instance status checks must be a (>0) integer when provided. Found {}'.format(error_preamble, tisc)
+            tiav = component_val.get('timeout_inst_adjust_validated')
+            if tiav:
+                assert isinstance(tisc, int) and tisc > 0, '{} Time out for instance adjust validation must be a (>0) integer when provided. Found {}'.format(error_preamble, tiav)
+            bc = component_val.get('batch_cooldown')
             if bc:
-                assert isinstance(bc, int) and bc > 0, 'Batch cooldown time must be a (>0) integer when provided'
+                assert isinstance(bc, int) and bc > 0, '{} Batch cooldown time must be a (>0) integer when provided. Found {}'.format(error_preamble, bc)
+
+            validator = component_val.get('validator')
+            if validator:
+                assert isinstance(validator, dict), '{} validator must be a dictionary when provided. Found: {}'.format(error_preamble, validator)
+                vfn = validator.get('filename')
+                assert vfn and isinstance(vfn, str), '{} validator dictionary must contain filename string when provided. Found: {}'.format(error_preamble, vfn)
+                vc = validator.get('component')
+                if vc:
+                    assert isinstance(vc, str), '{} validator component must be a string when provided. Found: {}'.format(error_preamble, vc)
+
+    def query(self):
+        retVal = {'application':{'components': {}}}
+
+        for component_key, config_vals in self.config[CONFIG_KEY].items():
+            groups = config_vals['asg'].split(",")
+            ref_groups = config_vals.get('ref_asg')
+            if ref_groups:
+                ref_groups = ref_groups.split(",")
+
+            it_settings = config_vals.get('settings', {}).get('inst_type', {})
+            inst_vals = it_settings.get('values', list(INST_TYPES))
+            it_type = it_settings.get('type', 'enum')
+            it_unit = it_settings.get('unit', 'ec2')
+            
+            tgt_insts, ref_insts = [], []
+            inst_types = set()
+            for gname in groups:
+                inst_types.add(self.query_asg_launch_info(gname)[0])
+                if(ref_groups):
+                    tgt_insts.extend(self.get_asg_instances(gname))
+        
+            inst_type = "(multiple)" if len(inst_types) > 1 else inst_types.pop()
+            retVal['application']['components'][component_key] = { 'settings': { 'inst_type': { "value" : inst_type, "type" : it_type, "values" : inst_vals, "unit" : it_unit }}}
+                
+
+            if ref_groups:
+                for gname in ref_groups:
+                    ref_insts.extend(self.get_asg_instances(gname))
+                    
+                retVal['monitoring'] = {
+                    'instance_ids': [ i["InstanceId"] for i in tgt_insts],
+                    'ref_instance_ids': [ i["InstanceId"] for i in ref_insts]
+                }
+        
+        return retVal
 
     def adjust(self, data=None):
         assert data, 'Received no settings to adjust.'
-        # TODO: fix progress percentages
+        
+        progress_weight = 100 / len(self.config[CONFIG_KEY])
         self.progress = 0
-        for component_key in self.config['ec2win']:
+        for component_key, component_config in self.config[CONFIG_KEY].items():
             settings = data['application']['components'].pop(component_key, {}).get('settings')
             if not settings:
+                self.progress += progress_weight
                 continue # no settings for this component
 
-            if self.config['ec2win'][component_key].get('encoder'):
-                self.progress_message = "adjusting {} component. Encoding settings".format(component_key)
-                self.print_progress()
-
-                import encoders.base as enc
-                script = enc.encode(self.config['ec2win'][component_key]['encoder'], settings)[0]
-                
-                # self.progress = 25
-                self.progress_message = "encoded settings, uploading script to bucket"
-                self.print_progress()
-
-                script_bytes = script.encode()
-                self.s3.put_object(Body=script_bytes, Bucket=self.config['ec2win'][component_key]['s3_bucket'], Key=self.config['ec2win'][component_key]['s3_path'])
-
-                # self.progress = 50
-                self.progress_message = "adjusted settings"
-                self.print_progress()
-        
             # Adjust ASG launch template if needed
-            groups = self.config["ec2win"][component_key]["asg"].split(",")
+            groups = component_config["asg"].split(",")
             changed_lst = []
             new_inst_type = settings.get('inst_type')
             if new_inst_type:
                 new_inst_type_val = new_inst_type.get("value")
                 if not new_inst_type_val:
-                    raise Exception("No 'value' key provided inst_type dict")
+                    raise Exception("No 'value' key provided in inst_type dict")
                 changed_lst = self.update_asg_instance_types(groups, new_inst_type_val)
 
             size = len(changed_lst)
-            # self.progress = 60
-            self.progress_message = "adjusted {} asg instance types".format(size)
+            self.progress_message = "Component {}: adjusted {} asg's instance types".format(component_key, size)
             self.print_progress()
 
             # Terminate batch_size instances in each group belonging to the component, wait for ready before terminating next batch
-            bs = self.config['ec2win'][component_key].get('batch_size', 1)
+            bs = component_config.get('batch_size', 1)
 
+            # key= group name, value= all InService instances in group at start of termination loop instances are removed as they are terminated
+            #   Once all instances from a group have been terminated, the group is removed from this dict
             grp_insts = {}
-            validated_insts = {} # keep track of validated instance IDs to exclude from describe endpoint validation
+            validated_insts = {} # validated instance IDs to exclude from validation
             group_counts = {} # count of total number of instances per group, used to track progress
             num_batches = 1
             num_instances = 0
+            
             for g in groups:
                 grp_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g) if i["LifecycleState"] == "InService" ] 
-                if len(grp_insts[g]) < 1:
+                if len(grp_insts[g]) < 1: # dont wait for empty groups
                     grp_insts.pop(g)
-                else:
+                else: # init data for tracking group termination
                     group_counts[g] = len(grp_insts[g])
                     validated_insts[g] = []
                     num_instances += group_counts[g]
-                    num_batches = max(num_batches, (group_counts[g]//bs + 1 if group_counts[g]%bs > 0 else 0 ))
-            cur_batch_num = 0
+                    num_batches = max(num_batches, (group_counts[g] // bs + (group_counts[g] % bs > 0) ))
 
-            # Empty dict == false
             if not grp_insts:
                 raise Exception('Component {}: no group instances to adjust in ASG(s) {}'.format(component_key, ', '.join(groups)))
+
             num_asgs = len(grp_insts)
-            # self.progress = 65
-            self.progress_message = "Terminating {} ASGs totalling {} instances in {} batches of {}".format(num_asgs, num_instances, num_batches, bs)
+            self.progress_message = "Component {}: Terminating {} ASGs totalling {} instances in {} batches of {}"\
+                ''.format(component_key, num_asgs, num_instances, num_batches, bs)
             self.print_progress()
 
             outer_start_time = time.time()
-            adjust_timeout = self.config['ec2win'][component_key].get('timeout_adjust_per_batch', 720) * num_batches
-
-            if self.config['ec2win'][component_key].get('describe_endpoint'): # format validation endpoint when provided
-                desc_endpoint_frmtstr = 'http://{{}}:{}/{}'.format(self.config['ec2win'][component_key].get('describe_port', 8080), self.config['ec2win'][component_key]['describe_endpoint'])
+            adjust_timeout = component_config.get('timeout_adjust_per_batch', 720) * num_batches
             
+            if component_config.get('validator'):
+                # Import and call external get_validator() to get validation method which returns list of failing instances
+                loader = importlib.machinery.SourceFileLoader('validation_driver', component_config['validator']['filename'])
+                mod = types.ModuleType(loader.name)
+                loader.exec_module(mod)
+                validator = mod.get_validator.__func__()
+
+                validator_comp = component_config['validator'].get('component', component_key)
+        
+            cur_batch_num = 0
             while len(grp_insts) > 0:
                 cur_batch_num += 1
-                self.progress_message = "Terminating {} ASGs totalling {} instances in batches of {}: batch {} of {}".format(num_asgs, num_instances, bs, cur_batch_num, num_batches)
+                self.progress_message = "Component {}: Terminating {} ASGs totalling {} instances in batches of {}: batch {} of {}"\
+                    ''.format(component_key, num_asgs, num_instances, bs, cur_batch_num, num_batches)
                 self.print_progress()
 
                 if time.time() - outer_start_time > adjust_timeout:
@@ -239,17 +246,12 @@ class Ec2WinDriver(Adjust):
 
                 # Store current keys as they may be removed by the time we wait
                 wait_list = list(grp_insts.keys())
-                
-                copy_grp_insts = dict(grp_insts)
+                copy_grp_insts = dict(grp_insts) # make copy to loop over so modification of OG doesn't cause errors
                 for g in copy_grp_insts:
-                    rmng_insts = grp_insts.pop(g, None)
-
-                    if rmng_insts is None:
-                        continue
-                    
+                    rmng_insts = grp_insts.pop(g)
                     term_batch.extend(rmng_insts[:bs])
                     rmng_insts = rmng_insts[bs:]
-                    if len(rmng_insts) > 0: # If no more to terminate, remove key from grp_insts
+                    if len(rmng_insts) > 0: # Add back to grp_insts if more to terminate
                         grp_insts[g] = rmng_insts
                 
                 if len(term_batch) < 1:
@@ -258,143 +260,62 @@ class Ec2WinDriver(Adjust):
                 # Terminate instances
                 self.terminate_instances_and_wait_for_status_checks(term_batch, wait_list, component_key)
 
-                if not self.config['ec2win'][component_key].get('describe_endpoint'):
-                    # wait an amount of time to allow windows init to finish, split in 30s intervals for heartbeat
-                    batch_cooldown = self.config['ec2win'][component_key].get('batch_cooldown', 120)
-                    for _ in range(batch_cooldown // 30):
-                        time.sleep(30)
-                        self.print_progress()
-                    
-                    if batch_cooldown % 30 > 0:
-                        time.sleep(batch_cooldown % 30)
-                        self.print_progress()
-                else:
-                    new_insts = {}
-                    for g in wait_list:
-                        new_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g)
-                            # terminated instances continue to show up for a while after termination
-                            if i["LifecycleState"] == "InService"
-                            and i["InstanceId"] not in term_batch
-                            # and not in instances yet to be terminated
-                            and i["InstanceId"] not in grp_insts.get(g, [])
-                            # and not in instances we've already validated
-                            and i["InstanceId"] not in validated_insts[g] ]
-                        
-                        if len(new_insts[g]) < 1:
-                            new_insts.pop(g)
+                # If external validator is not defined in config wait batch_cooldown seconds
+                # Otherwise, use imported validator specified in config to wait for and validate ec2 instances
+                if not component_config.get('validator'):
+                    # wait an amount of time to allow system init to finish, split in 30s intervals for heartbeat
+                    batch_cooldown = component_config.get('batch_cooldown', 600)
+                    self.progress_message = "Component {}: Terminated {} ASGs, waiting {} seconds"\
+                        ''.format(component_key, num_asgs, batch_cooldown)
+                    time.sleep(batch_cooldown)
 
-                    list_new_inst_ids = []
-                    for g in new_insts:
-                        list_new_inst_ids.extend(new_insts[g])
-
-                    if len(list_new_inst_ids) != len(term_batch):
-                        raise Exception("Unable to retrieve new EC2 instances for groups {}. Count found: {}, count expected: {}".format(', '.join(wait_list) , len(list_new_inst_ids), len(term_batch)))
-
-                    inst_stat_resp = self.ec2.describe_instances(InstanceIds=list_new_inst_ids)
-                    if not inst_stat_resp or not inst_stat_resp.get('Reservations'):
-                        raise Exception("Unable to describe new EC2 instances via boto3 client. Response: {}".format(inst_stat_resp))
-
-                    new_insts_described = []
-                    for r in inst_stat_resp['Reservations']:
-                        new_insts_described.extend(r['Instances'])
-
-                    if len(new_insts_described) != len(term_batch):
-                        raise Exception("Unable to retrieve detailed info (IP addr) for new EC2 instances. Count found: {}, count expected: {}".format(len(new_insts_described), len(term_batch)))
-
-                    adj_validation_passed = self.wait_for_condition_or_timeout(
-                        evaluator=lambda: self.get_failed_adjust_insts(
-                            described_instances=new_insts_described, 
-                            endpoint_frmtstr=desc_endpoint_frmtstr, 
-                            encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
-                            settings_to_verify=settings
-                        ) == [], # Note evaluator is waiting failed insts to be empty array
-                        timeout=self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300)
+                else: # Run validator on newly instantiated instances
+                    failed_insts = self.validate_new_instances(
+                        validator=validator,
+                        validator_comp=validator_comp,
+                        settings_to_validate=settings,
+                        validation_timeout=component_config.get('timeout_inst_adjust_validated', 300),
+                        group_list=wait_list,
+                        term_list=term_batch,
+                        remaining_grp_insts=grp_insts,
+                        validated_grp_insts=validated_insts,
+                        expected_count=len(term_batch)
                     )
-                    # "Timed out waiting for validation of new instances' adjustments"
-                    if not adj_validation_passed:
+                    
+                    # Attempt to terminate failing instances 3 times before erroring
+                    if failed_insts:
                         termination_attempts = 3
                         failed_list = []
                         while termination_attempts > 0:
-                            failed_insts = self.get_failed_adjust_insts(
-                                described_instances=new_insts_described, 
-                                endpoint_frmtstr=desc_endpoint_frmtstr, 
-                                encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
-                                settings_to_verify=settings
-                            )
                             failed_list.extend(failed_insts)
 
-                            for g in new_insts:
-                                validated_insts[g].extend([i for i in new_insts[g] if i not in failed_insts])
-                                new_insts[g] = [i for i in new_insts[g] if i in failed_insts]
-                                if len(new_insts[g]) < 1:
-                                    new_insts.pop(g)
-
-                            wait_list = list(new_insts.keys())
-
-                            # Terminate failed instances
+                            # Terminate new instances that failed validation
                             self.terminate_instances_and_wait_for_status_checks(failed_insts, wait_list, component_key)
 
-                            new_insts = {}
-                            for g in wait_list:
-                                new_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g)
-                                    # terminated instances continue to show up for a while after termination
-                                    if i["LifecycleState"] == "InService"
-                                    and i["InstanceId"] not in term_batch
-                                    and i["InstanceId"] not in failed_list
-                                    # and not in instances yet to be terminated
-                                    and i["InstanceId"] not in grp_insts.get(g, [])
-                                    # and not in instances we've already validated
-                                    and i["InstanceId"] not in validated_insts[g] ]
-                                
-                                if len(new_insts[g]) < 1:
-                                    new_insts.pop(g)
+                            failed_insts = self.validate_new_instances(
+                                validator=validator,
+                                validator_comp=validator_comp,
+                                settings_to_validate=settings,
+                                validation_timeout=component_config.get('timeout_inst_adjust_validated', 300),
+                                group_list=wait_list,
+                                term_list=term_batch + failed_list,
+                                remaining_grp_insts=grp_insts,
+                                validated_grp_insts=validated_insts,
+                                expected_count=len(failed_insts)
+                            )
 
-                            list_new_inst_ids = []
-                            for g in new_insts:
-                                list_new_inst_ids.extend(new_insts[g])
-
-                            if len(list_new_inst_ids) != len(failed_insts):
-                                raise Exception("During termination retry, Unable to retrieve new EC2 instances for groups {}. Count found: {}, count expected: {}".format(', '.join(wait_list) , len(list_new_inst_ids), len(failed_insts)))
-
-                            inst_stat_resp = self.ec2.describe_instances(InstanceIds=list_new_inst_ids)
-                            if not inst_stat_resp or not inst_stat_resp.get('Reservations'):
-                                raise Exception("During termination retry, Unable to describe new EC2 instances via boto3 client. Response: {}".format(inst_stat_resp))
-
-                            new_insts_described = []
-                            for r in inst_stat_resp['Reservations']:
-                                new_insts_described.extend(r['Instances'])
-
-                            if len(new_insts_described) != len(failed_insts):
-                                raise Exception("During termination retry, Unable to retrieve detailed info (IP addr) for new EC2 instances. Count found: {}, count expected: {}".format(len(new_insts_described), len(failed_insts)))
-
-                            if self.wait_for_condition_or_timeout(
-                                evaluator=lambda: self.get_failed_adjust_insts(
-                                    described_instances=new_insts_described, 
-                                    endpoint_frmtstr=desc_endpoint_frmtstr, 
-                                    encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
-                                    settings_to_verify=settings
-                                ) == [], # Note evaluator is waiting failed insts to be empty array
-                                timeout=self.config['ec2win'][component_key].get('timeout_inst_adjust_validated', 300)
-                            ):
-                                for g in new_insts:
-                                    validated_insts[g].extend(new_insts[g])
+                            if not failed_insts:
                                 break
 
                             termination_attempts -= 1
 
                         if termination_attempts == 0:
-                            failed_insts = self.get_failed_adjust_insts(
-                                described_instances=new_insts_described, 
-                                endpoint_frmtstr=desc_endpoint_frmtstr, 
-                                encoder_method=lambda describe_data: self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data),
-                                settings_to_verify=settings
-                            )
                             raise Exception("Validation failed for {} instances after 3 attempts to terminate and re-create the instances. Failed instance IDs: {}".format(len(failed_insts), ", ".join(failed_insts)))
-                            
-                    else:                    
-                        # Validation complete, add current iteration to validated list
-                        for g in new_insts:
-                            validated_insts[g].extend(new_insts[g])
+
+            self.progress += progress_weight
+            self.progress_message = "Component {}: Adjusted {} ASGs"\
+                ''.format(component_key, num_asgs)
+            self.print_progress()
 
 
         # check for components not in config
@@ -435,7 +356,6 @@ class Ec2WinDriver(Adjust):
         return True
 
     def get_asg_info(self, gname):
-        # TODO: paginate response
         a = self.asg.describe_auto_scaling_groups(AutoScalingGroupNames=[gname])
         # describe_auto_.. doesn't fail if asg not found, check for it:
         if not a.get("AutoScalingGroups"):
@@ -520,7 +440,7 @@ class Ec2WinDriver(Adjust):
     def update_asg_instance_types(self, groups, new_inst_type):
         changed_lst = []
         for g in groups:
-            asg_lt_info = self.query_asg_launch_info(g) # tuple [3]
+            asg_lt_info = self.query_asg_launch_info(g) # tuple
 
             if new_inst_type == asg_lt_info[0]:
                 continue # current template version has same instance type
@@ -528,7 +448,9 @@ class Ec2WinDriver(Adjust):
             changed_lst.append(g)
             if asg_lt_info[3] == 'template':
                 new_lt_data = { "InstanceType": new_inst_type }
-                self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=str(asg_lt_info[2]), LaunchTemplateData=new_lt_data)
+                resp = self.ec2.create_launch_template_version(LaunchTemplateName=asg_lt_info[1],SourceVersion=str(asg_lt_info[2]), LaunchTemplateData=new_lt_data)
+                if not resp.get('LaunchTemplateVersion'):
+                    raise Exception('Failed to update Launch Template with new instance type. Response: {}'.format(resp))
                 # Done here. NOTE: assumes ASG is configured to reference latest launch template
             elif asg_lt_info[3] == 'config':
                 # Update launch config
@@ -537,7 +459,7 @@ class Ec2WinDriver(Adjust):
                 # old_lc_name = asg_lt_info[4]["LaunchConfigurationName"] # TODO verify against cached info to safely delete
                 new_lc = asg_lt_info[4]
                 # Fix or remove props which fail param validation
-                new_lc["UserData"] = base64.b64decode(new_lc["UserData"]) # kinda silly that we have to do this ¯\_(ツ)_/¯
+                new_lc["UserData"] = base64.b64decode(new_lc["UserData"]) # kinda silly that we have to decode this ¯\_(ツ)_/¯
                 new_lc.pop("LaunchConfigurationARN")
                 new_lc.pop("CreatedTime")
                 if new_lc["RamdiskId"] == '':
@@ -547,9 +469,13 @@ class Ec2WinDriver(Adjust):
 
                 new_lc["LaunchConfigurationName"] = new_lc_name
                 new_lc["InstanceType"] = new_inst_type
-                self.asg.create_launch_configuration(**new_lc)
+                resp = self.asg.create_launch_configuration(**new_lc)
+                if resp.get('ResponseMetadata', {}).get('HTTPStatusCode') != 200:
+                    raise Exception('Failed to create new Launch Config with updated instance type. Response: {}'.format(resp))
                 # Update asg to use new config
-                self.asg.update_auto_scaling_group(AutoScalingGroupName=g, LaunchConfigurationName=new_lc_name)
+                resp = self.asg.update_auto_scaling_group(AutoScalingGroupName=g, LaunchConfigurationName=new_lc_name)
+                if resp.get('ResponseMetadata', {}).get('HTTPStatusCode') != 200:
+                    raise Exception('Failed to update Auto Scaling Groups with newly created Launch Config. Response: {}'.format(resp))
                 # self.asg.delete_launch_configuration(LaunchConfigurationName=old_lc_name) # TODO verify against cached info to safely delete
 
             else:
@@ -574,149 +500,96 @@ class Ec2WinDriver(Adjust):
         # Wait for ASGs to reach pre-termination quantity of instances
         if not self.wait_for_condition_or_timeout(
             lambda: self.verify_asg_desired_capacity(groups, termination_ids),
-            self.config['ec2win'][calling_component].get('timeout_inst_create', 300)
+            self.config[CONFIG_KEY][calling_component].get('timeout_inst_create', 300)
         ):
             raise Exception("Timed out waiting for ASG to make new instances for component {}".format(calling_component))
 
         # Wait for all instances in each wait group to pass status checks
         if not self.wait_for_condition_or_timeout(
             lambda: self.verify_asg_status_checks(groups, termination_ids),
-            self.config['ec2win'][calling_component].get('timeout_inst_status_check', 300),
+            self.config[CONFIG_KEY][calling_component].get('timeout_inst_status_check', 300),
             pre_check=True
         ):
             raise Exception("Timed out waiting for new instances to pass status check for component {}".format(calling_component))
-            
-    # Unlike the other validators, this will return a list of failing instances to facilitate their termination
-    def get_failed_adjust_insts(self, described_instances, endpoint_frmtstr, encoder_method, settings_to_verify):
-        failed_instances = []
-        for i in described_instances:
-            desc_endpoint = endpoint_frmtstr.format(i["PublicIpAddress"])
-            try:
-                describe_resp = urllib.request.urlopen(url=desc_endpoint, timeout=10)
-            except urllib.error.URLError: # 10s timeout will trigger URLError but that is expected on fresh instances
-                failed_instances.append(i["InstanceId"])
-                continue
-            except socket.timeout:
-                failed_instances.append(i["InstanceId"])
-                continue
-            if describe_resp.status != 200:
-                failed_instances.append(i["InstanceId"])
-                continue
 
-            raw_data = describe_resp.read()
-            if raw_data.startswith(codecs.BOM_UTF16_LE):
-                raw_data = raw_data[len(codecs.BOM_UTF16_LE):] # remove BOM
-                describe_data = raw_data.decode('utf_16_le')
-            else:
-                failed_instances.append(i["InstanceId"])
-                continue
-                # TODO: log this
-                # raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
+    # Returns list of instances failing validation after timeout expires
+    # Updates param validated_grp_insts with instances that passed
+    # Updates param group_list to remove groups that passed validation
 
-            # The failures we're concerned with here-in are limited to IIS failing to deploy and producing 500 error codes and the json never being available
-            # Misalignment of settings would be indicative of some other type of issue so it produces an error accordingly
-            desc_settings = encoder_method(describe_data)
-            for key in desc_settings:
-                if settings_to_verify.get(key) and desc_settings[key]['value'] != settings_to_verify[key]['value']:
-                    raise Exception('Validation failed for setting {}: describe endpoint value {} did not match input value {}'.format(
-                            key,
-                            desc_settings[key]['value'],
-                            settings_to_verify[key]['value']
-                        ))
-        
-        return failed_instances
-
-    def query(self):
-        retVal = {'application':{'components': {}}}
-
-        for component_key in self.config['ec2win']:
-            # Query Windows settings
-            retVal['application']['components'][component_key] = { 'settings': {} }
-            if self.config['ec2win'][component_key].get('encoder'):
-                ec2_ip = self.config['ec2win'][component_key].get('ec2_ip')
-                if ec2_ip is None:
-                    try:
-                        response = self.s3.get_object(Bucket=self.config['ec2win'][component_key]['s3_bucket'], Key=self.config['ec2win'][component_key]['s3_path'])
-                        describe_string = response['Body'].read().decode('utf-8')
-                    except Exception as e:
-                        self.print_json_error(
-                            e.__class__.__name__,
-                            "failure",
-                            str(e)
-                        )
-                        describe_string = ''
-                    retVal['application']['components'][component_key]['settings'] = self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_string)
-
-                else:
-                    describe_port = self.config['ec2win'][component_key].get('describe_port', '8080')
-                    desc_path = self.config['ec2win'][component_key].get('describe_endpoint', 'describe.json')
-                    desc_endpoint = 'http://{}:{}/{}'.format(ec2_ip, describe_port, desc_path)
-                    describe_resp = urllib.request.urlopen(desc_endpoint)
-                    if describe_resp.status == 404:
-                        raise Exception ("Servo describe data could not be located at web endpoint '{}'".format(desc_endpoint))
-
-                    if describe_resp.status != 200:
-                        raise Exception ("Servo describe web endpoint ('{}') returned status '{}'".format(desc_endpoint, describe_resp.status))
-
-                    raw_data = describe_resp.read()
-                    if raw_data.startswith(codecs.BOM_UTF16_LE):
-                        raw_data = raw_data[len(codecs.BOM_UTF16_LE):]
-                        describe_data = raw_data.decode('utf_16_le')
-                    else:
-                        raise Exception ("Servo describe data returned with unexpected encoding. Only utf_16_le is supported currently")
-
-                    retVal['application']['components'][component_key]['settings'] = self.encode_describe_if_needed(None, self.config['ec2win'][component_key], describe_data)
-
-            # Query ASG settings
-            groups = self.config['ec2win'][component_key]['asg'].split(",")
-            ref_groups = self.config['ec2win'][component_key].get('ref_asg')
-            if ref_groups:
-                ref_groups = ref_groups.split(",")
-            
-            tgt_insts = []
-            ref_insts = []
-
-            it_settings = self.config['ec2win'][component_key].get('settings', {}).get('inst_type', {})
-            inst_vals = it_settings.get('values', list(INST_TYPES))
-            it_type = it_settings.get('type', 'enum')
-            it_unit = it_settings.get('unit', 'ec2')
-            inst_types = set()
-            for gname in groups:
-                inst_types.add(self.query_asg_launch_info(gname)[0])
-                if(ref_groups):
-                    tgt_insts.extend(self.get_asg_instances(gname))
-        
-            inst_type = "(multiple)" if len(inst_types) > 1 else inst_types.pop()
-            retVal['application']['components'][component_key]['settings']["inst_type"] = { "value" : inst_type, "type" : it_type, "values" : inst_vals, "unit" : it_unit }
-                
-
-            if ref_groups:
-                for gname in ref_groups:
-                    ref_insts.extend(self.get_asg_instances(gname))
-                    
-                retVal['monitoring'] = {
-                    'instance_ids': [ i["InstanceId"] for i in tgt_insts],
-                    'ref_instance_ids': [ i["InstanceId"] for i in ref_insts]
-                }
-        
-        return retVal
-
-
-    def encode_describe_if_needed(self, name, data, value):
+    def validate_new_instances(self, validator, validator_comp, settings_to_validate, validation_timeout, group_list, term_list, remaining_grp_insts, validated_grp_insts, expected_count):
         """
-        Takes:
-            * a setting name
-            * setting data (as defined in the config)
-            * value (as returned by the underlying infrastructure)
+        Collects and performs validation on newly created instances
 
-        Returns a dict in the format { <setting_name> : { <setting_data> }},
-        suitable for returning as a description. At the very minimun,
-        <setting_data> will return the current "value". If the config for that
-        setting specifies an encoder to be used, the returned "value" ( in
-        <setting_data>) will be decoded by the encoder specified in the config.
+        Parameters:
+            validator (callable): The function used to validate the new EC2 instances
+            validator_comp (Str): Name of the external driver component from which the validator gets its configuration
+            settings_to_validate (dict): Settings to be validated as recieved from input
+            validation_timeout (int): Amount of time to wait for new instances to pass validation before considering non-passing insts to have failed
+            group_list (list): List of groups to get new instances for. Will be updated by this method to remove groups whose new instances have passed validation
+            term_list (list): List of instance IDs which have been terminated. Such instances remain "InService" for a suprisingly long time so this is used to prevent them from being gathered with the newly created instances
+            remaining_grp_insts (dict): Dictionary (key: group_name, value: list of instance IDs) of the instances that will be terminated in later iterations. Used to prevent them from being gathered with the newly created instances
+            validated_grp_insts (dict): Dictionary (key: group_name, value: list of instance IDs) of the instances that have already passed validation. Used to prevent them from being gathered with the newly created instances. Will be updated by this method with the new instances which have passed validation
+            expected_count (int): Number of instances terminated in last iteration, used to verify the appropriate number of new instances were created by the ASGs
+
+        Returns:
+            list: The IDs of the instances which did not pass validation once the timeout expired
         """
-        import encoders.base as enc
-        return enc.describe(data["encoder"], value)
+        new_insts = {}
+        for g in group_list:
+            new_insts[g] = [ i["InstanceId"] for i in self.get_asg_instances(g)
+                if i["LifecycleState"] == "InService"
+                # terminated instances continue to show up InService for a while after termination
+                and i["InstanceId"] not in term_list
+                # and not in instances yet to be terminated
+                and i["InstanceId"] not in remaining_grp_insts.get(g, [])
+                # and not in instances we've already validated
+                and i["InstanceId"] not in validated_grp_insts[g] ]
+            
+            if len(new_insts[g]) < 1:
+                new_insts.pop(g)
+
+        list_new_inst_ids = []
+        for g in new_insts:
+            list_new_inst_ids.extend(new_insts[g])
+
+        if len(list_new_inst_ids) != expected_count:
+            raise Exception("Unable to retrieve new EC2 instances for groups {}. Count found: {}, count expected: {}".format(', '.join(group_list) , len(list_new_inst_ids), expected_count))
+
+        inst_stat_resp = self.ec2.describe_instances(InstanceIds=list_new_inst_ids)
+        if not inst_stat_resp or not inst_stat_resp.get('Reservations'):
+            raise Exception("Unable to describe new EC2 instances via boto3 client. Response: {}".format(inst_stat_resp))
+
+        new_insts_described = []
+        for r in inst_stat_resp['Reservations']:
+            new_insts_described.extend(r['Instances'])
+
+        if len(new_insts_described) != expected_count:
+            raise Exception("Unable to retrieve detailed info (IP addr) for new EC2 instances. Count found: {}, count expected: {}".format(len(new_insts_described), expected_count))
+
+        failed_insts = []
+        def evaluator():
+            nonlocal failed_insts
+            failed_insts = validator(
+                component_key=validator_comp,
+                described_instances=new_insts_described,
+                settings_to_verify=settings_to_validate
+            )
+            return failed_insts == []
+
+        self.wait_for_condition_or_timeout(
+            evaluator=evaluator,
+            timeout=validation_timeout
+        )
+
+        for g in dict(new_insts):
+            validated_grp_insts[g].extend([i for i in new_insts[g] if i not in failed_insts])
+            new_insts[g] = [i for i in new_insts[g] if i in failed_insts]
+            if len(new_insts[g]) < 1:
+                new_insts.pop(g)
+        
+        group_list = list(new_insts.keys())
+
+        return failed_insts
 
 
 if __name__ == '__main__':
