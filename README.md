@@ -1,44 +1,15 @@
+# TODO: remove ec2s3 artifacts
 # servo-ec2win
 
 _Optune adjust driver for EC2 Instances_
 
-This driver presently updates settings of EC2 instances using commands stored on an s3 bucket. The types of commands and supported EC2 targets are dependent on the bundled encoder. It will also adjust the instance type of the ASG launch template or config as needed. On each adjustment iteration, all instances in under the `asg:` tags will be terminated in batches, waiting for the new instances to be ready before moving to the next batch.
+This driver  updates the instance type of the configued ASG(s) launch template(s) and/or config(s). On each adjustment iteration, all instances in under the `asg:` tags will be terminated in batches, waiting for the new instances to be ready before moving to the next batch. During readyness checking, this driver supports an optional external validator from another driver (such as servo-ec2s3) via the `validator` section of the config. When specified, the `validator` must inidicate the file name from which the static `get_validator()` method will be imported and invoked (see: config.yaml.example)
 
 __Note__ order of destroying instances currently does not take into account availability zones which may violate HA requirements
 
-__Note__ this driver requires `adjust.py` and `encoders/base.py` base classes from the [Optune servo core](https://github.com/opsani/servo/). They can be copied or symlinked here as part of packaging. 
-
-__Note__ An encoder class will also be required. While this driver is mostly intended for use with the [dotnet encoder class](https://github.com/kumulustech/encoder-dotnet/) (`encoders/dotnet.py`), other encoders based on the Opsani base should be compatible. See `servo/Dockerfile` and `servo-jvm/Dockerfile` in this repo for examples
-
-When the `describe_endpoint` is configured in config.yaml, it must point to a web endpoint populated with content that is parsable by the bundled encoder. Once retrieved and parsed, the endpoint data is used to verify the settings have taken effect. (__Note__ the text encoding of the endpoint is currently expected to be UTF_16LE).
-
-When `describe_endpoint` is used with the dotnet encoder, the endpoint contains resulting json from the ps1 script produced by the `encode_describe` method of said dotnet encoder class. __Note__ as new Windows settings are added, their respective `encode_describe` methods must also be implemented in order to keep the describe.ps1 script produced by the encoder up to date. See `describe_endpoint_dotnet.ps1.example` and `user_data_dotnet.example` for usage
-
 ## Required IAM Permissions
 
-All hosts that reference the config file should have an IAM role (instance profile) configured with a policy to allow read only access to the desired bucket path. For example:
-
-```
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "VisualEditor0",
-            "Effect": "Allow",
-            "Action": [
-                "s3:Get*",
-                "s3:List*"
-            ],
-            "Resource": [
-                "arn:aws:s3:::example-bucket.example.com/ws2012-sandbox/*",
-                "arn:aws:s3:::example-bucket.example.com"
-            ]
-        }
-    ]
-}
-```
-
-As for the account provided for the servo, the permissions required are:
+The account provided for the servo requires the following permissions:
 
 EC2 Permissions
 
@@ -50,12 +21,7 @@ EC2 Permissions
 
 IAM Permissions
 
-- iam:PassRole - Must apply to the readonly role detailed above, can be exluded when only launch templates are used or if launch configs do not specify an instance profile
-
-S3 Permissions; For updating and parsing adjust file in s3, can be excluded if only adjusting instance type
-
-- s3:PutObject
-- s3:GetObject
+- iam:PassRole - Must apply to any instance profile associated with the target instances, can be exluded when only launch templates are used or if launch configs do not specify an instance profile
 
 Autoscaling Permissions
 
@@ -64,39 +30,40 @@ Autoscaling Permissions
 - autoscaling:DescribeLaunchConfigurations - can be exluded when using only launch templates
 - autoscaling:UpdateAutoScalingGroup - can be exluded when using only launch templates
 
-## Installation (encoder-dotnet)
+## Installation
 
-1. Echo optune token into docker secret: `echo -n 'YOUR AUTH TOKEN' | docker secret create optune_auth_token -`
-1. Run `docker build servo/ -t example.com/servo-ec2win-ab`
-1. Referring to `config.yaml.example` create file `config.yaml` in driver's folder. It will contain settings you'd want to make adjustable on your Windows Server instance.
-1. Create `.aws` folder with needed credential and permission
-1. Create a docker service:
+```bash
+docker build -t opsani/servo-ec2win-ab servo/
 
-```
-docker service create -t
-    --name DOCKER_SERVICE_NAME \
-    --secret optune_auth_token \
-    --env AB_TEST_URL= APACHED_BENCHMARK_URL \
-    --mount type=bind,source=/PATH/TO/config.yaml,destination=/servo/config.yaml \
-    --mount type=bind,source=/PATH/TO/.aws/,destination=/root/.aws/ \
-    example.com/servo-ec2win-ab \
-    APP_NAME  \
-    --account USER_ACCOUNT \
+docker run -d --name opsani-servo \
+    -v /path/to/optune_auth_token:/opt/optune/auth_token \
+    -v /path/to/config.yaml:/servo/config.yaml \
+    opsani/servo-ec2win-ab --auth-token /opt/optune/auth_token --account my_account my_app
 ```
 
-## How to run tests with dotnet encoder
+Where:
+
+- `/path/to/optune_auth_token` - file containing the authentication token for the Optune backend service
+- `/path/to/config.yaml` - config file containing (see above for details).
+- `my_account` - your Optune account name
+- `my_app` - the application name
+
+## How to run tests with ec2s3 validator and dotnet encoder
 
 Prerequisites:
 
-* Python 3.5 or higher
-* PyTest 4.3.0 or higher
+- Python 3.5 or higher
+- PyTest 4.3.0 or higher
 
 Follow these steps:
 
 1. Pull the repository
-1. Copy/symlink `adjust` (no file extension) from this repo's project folder to folder `test/`, rename to `adjust.py`
-1. Copy/symlink `adjust.py` from `https://github.com/opsani/servo/tree/master/` to folder `test/`, rename to `base_adjust.py`
+1. Copy/symlink `adjust` (no file extension) from this repo's project folder to folder `test/`, rename to `adjust_driver.py`
+1. Copy/symlink `adjust.py` from `https://github.com/opsani/servo` to folder `test/`
+1. (Optional) Copy/symlink `adjust` (no file extension) from  `https://github.com/kumulustech/servo-ec2s3` to folder `test/`, rename to `validation_driver`
 1. Copy/symlink `base.py` from `https://github.com/opsani/servo/tree/master/encoders` to folder `test/encoders/`
 1. Copy/symlink `dotnet.py` from `https://github.com/kumulustech/encoder-dotnet` to folder `test/encoders/`
 1. Source your aws_config.env file containing your AWS service key (or ensure your /home/user/.aws folder has a populated credentials file )
-1. Run `pytest` from the root folder
+    1. The account used must have the servo permissions detailed above
+1. Add a valid `config.yaml` to folder `test/` (see config.yaml.example for a reference)
+1. Run `python3 -m pytest` from the test folder
