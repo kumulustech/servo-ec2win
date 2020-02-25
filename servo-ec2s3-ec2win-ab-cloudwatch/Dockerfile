@@ -2,9 +2,12 @@ FROM python:3.6-slim
 
 WORKDIR /servo
 
-# Install dependencies
-RUN pip3 install requests PyYAML python-dateutil boto3 && \
-	apt-get update && apt-get install -y --no-install-recommends apache2-utils curl
+# Install dependencies (use latest pip packages)
+# hadolint ignore=DL3013
+RUN apt-get update && apt-get install -y --no-install-recommends apache2-utils curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install requests PyYAML python-dateutil boto3
 
 RUN mkdir adjust.d/ encoders/ measure.d/
 
